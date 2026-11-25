@@ -5,15 +5,22 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
 )
 
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	done := make(chan struct{})
 
-	// Write Proxy Protocol V2 Header
 	if proxyProtocol {
 		err := WriteProxyProtocol(from, to)
 		if err != nil {
@@ -40,11 +47,12 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 	}
 }
 
-// Using direct Read and Write for transferring data
 func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	buf := make([]byte, 16*1024) // 16K
+	bufPtr := copyBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer copyBufPool.Put(bufPtr)
+
 	for {
-		// Read data from the source connection
 		r, err := from.Read(buf)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -59,7 +67,6 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 
 		totalWritten := 0
 		for totalWritten < r {
-			// Write data to the destination connection
 			w, err := to.Write(buf[totalWritten:r])
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
@@ -70,15 +77,12 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 				from.Close()
 				to.Close()
 				return
-
 			}
 			totalWritten += w
 		}
 
-		logger.Tracef("read data: %d bytes, written data: %d bytes", r, totalWritten)
 		if sniffer {
 			usage.AddOrUpdatePort(remotePort, uint64(totalWritten))
 		}
 	}
-
 }

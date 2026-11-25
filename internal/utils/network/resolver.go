@@ -2,32 +2,31 @@ package network
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
 
 func ResolveRemoteAddr(remoteAddr string) (int, string, error) {
-	// Split the address into host and port
-	parts := strings.Split(remoteAddr, ":")
-	var port int
-	var err error
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return 0, "", fmt.Errorf("empty remote address")
+	}
 
-	// Handle cases where only the port is sent or host:port format
-	if len(parts) < 2 {
-		port, err = strconv.Atoi(parts[0])
-		if err != nil {
-			return 0, "", fmt.Errorf("invalid port format: %v", err)
-		}
-		// Default to localhost if only the port is provided
+	if port, err := strconv.Atoi(remoteAddr); err == nil && port >= 1 && port <= 65535 {
 		return port, fmt.Sprintf("127.0.0.1:%d", port), nil
 	}
 
-	// If both host and port are provided
-	port, err = strconv.Atoi(parts[1])
+	host, portStr, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return 0, "", fmt.Errorf("invalid port format: %v", err)
+		return 0, "", fmt.Errorf("invalid address format %q: %w", remoteAddr, err)
 	}
-
-	// Return the full resolved address
-	return port, remoteAddr, nil
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, "", fmt.Errorf("invalid port format %q: %w", portStr, err)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return port, net.JoinHostPort(host, portStr), nil
 }

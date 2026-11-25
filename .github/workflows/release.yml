@@ -1,0 +1,62 @@
+name: Build & Publish Backhaul (MControl Fork)
+
+on:
+  push:
+    branches: ["main", "mcontrol-custom"]
+    paths-ignore:
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Tidy, Vet & Build Static Binaries (amd64 & arm64)
+        id: build
+        run: |
+          VER=$(sed -nE 's/.*const version = "([^"]*)".*/\1/p' main.go | head -n1)
+          [ -n "$VER" ] || VER="v0.9.2"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          go mod tidy
+          go vet ./...
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/bh-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/bh-linux-arm64 .
+          cp dist/bh-linux-amd64 dist/bh
+          cd dist
+          for f in bh bh-linux-amd64 bh-linux-arm64; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -lh
+
+      - name: Publish GitHub Release (gh CLI)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Backhaul ${TAG} (MControl Custom)" --latest
+          else
+            gh release create "$TAG" --title "Backhaul ${TAG} (MControl Custom)" --generate-notes --latest
+          fi
+          for f in dist/bh dist/bh.sha256 dist/bh-linux-amd64 dist/bh-linux-amd64.sha256 dist/bh-linux-arm64 dist/bh-linux-arm64.sha256; do
+            ok=0
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber; then ok=1; break; fi
+              sleep $((attempt * 3))
+            done
+            [ "$ok" -eq 1 ] || exit 1
+          done
