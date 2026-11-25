@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"strconv"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"time"
@@ -40,6 +42,21 @@ func (c *Client) Start() {
 	}
 
 	c.logger.Infof("client with remote address %s started successfully", c.config.RemoteAddr)
+
+	if c.config.GameMode {
+		rh, rp, _ := net.SplitHostPort(c.config.RemoteAddr)
+		gBase := c.config.GameBasePort
+		if gBase <= 0 {
+			p, _ := strconv.Atoi(rp)
+			gBase = p + 10
+		}
+		go network.StartGameModeClient(c.ctx, network.GameModeConfig{
+			Token:      c.config.Token,
+			RemoteHost: rh,
+			BasePort:   gBase,
+			Copies:     c.config.GameCopies,
+		}, c.logger)
+	}
 
 	switch c.config.Transport {
 	case config.TCP:
@@ -248,6 +265,56 @@ func (c *Client) Start() {
 		}
 		xhttpClient := transport.NewXHTTPClient(c.ctx, xhttpCfg, c.logger)
 		go xhttpClient.Start()
+
+	case config.PARALLAX, config.PARALLAXMUX:
+		pxCfg := &transport.ParallaxClientConfig{
+			RemoteAddr:       c.config.RemoteAddr,
+			Token:            c.config.Token,
+			SnifferLog:       c.config.SnifferLog,
+			KeepAlive:        time.Duration(c.config.Keepalive) * time.Second,
+			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
+			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,
+			ConnPoolSize:     c.config.ConnectionPool,
+			WebPort:          c.config.WebPort,
+			Sniffer:          c.config.Sniffer,
+			AggressivePool:   c.config.AggressivePool,
+			Mux:              c.config.Transport == config.PARALLAXMUX,
+			MuxVersion:       c.config.MuxVersion,
+			MaxFrameSize:     c.config.MaxFrameSize,
+			MaxReceiveBuffer: c.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  c.config.MaxStreamBuffer,
+			SO_RCVBUF:        c.config.SO_RCVBUF,
+			SO_SNDBUF:        c.config.SO_SNDBUF,
+			MSS:              c.config.MSS,
+			Parallax: network.ParallaxParams{
+				Token:       c.config.Token,
+				Lanes:       c.config.ParallaxLanes,
+				WarmupMin:   c.config.ParallaxWarmupMin,
+				WarmupMax:   c.config.ParallaxWarmupMax,
+				StallSec:    c.config.ParallaxStallSec,
+				DialTimeout: time.Duration(c.config.DialTimeout) * time.Second,
+				KeepAlive:   time.Duration(c.config.Keepalive) * time.Second,
+				NoDelay:     c.config.Nodelay,
+				KCP: network.KCPParams{
+					Mode:        c.config.KCPMode,
+					Key:         c.config.KCPKey,
+					Crypt:       c.config.KCPCrypt,
+					DataShard:   c.config.KCPDataShard,
+					ParityShard: c.config.KCPParityShard,
+					MTU:         c.config.KCPMTU,
+					SndWnd:      c.config.KCPSndWnd,
+					RcvWnd:      c.config.KCPRcvWnd,
+					AckNoDelay:  c.config.KCPAcksNoDelay,
+					SO_RCVBUF:   c.config.SO_RCVBUF,
+					SO_SNDBUF:   c.config.SO_SNDBUF,
+				},
+			},
+		}
+		pxClient := transport.NewParallaxClient(c.ctx, pxCfg, c.logger)
+		go pxClient.Start()
+
+	case config.FAILOVER:
+		go c.startFailover()
 
 	default:
 		c.logger.Fatal("invalid transport type: ", c.config.Transport)

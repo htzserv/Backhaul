@@ -216,4 +216,66 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.XHTTPMode == "" {
 		cfg.Client.XHTTPMode = defaultXHTTPMode
 	}
+
+	// Phase 3: Parallax defaults
+	if cfg.Server.ParallaxLanes < 2 {
+		cfg.Server.ParallaxLanes = 4
+	} else if cfg.Server.ParallaxLanes > 12 {
+		cfg.Server.ParallaxLanes = 12
+	}
+	if cfg.Client.ParallaxLanes < 2 {
+		cfg.Client.ParallaxLanes = 4
+	} else if cfg.Client.ParallaxLanes > 12 {
+		cfg.Client.ParallaxLanes = 12
+	}
+	if cfg.Server.ParallaxWarmupMin <= 0 {
+		cfg.Server.ParallaxWarmupMin = 32 * 1024
+	}
+	if cfg.Server.ParallaxWarmupMax < cfg.Server.ParallaxWarmupMin {
+		cfg.Server.ParallaxWarmupMax = 64 * 1024
+	}
+	if cfg.Client.ParallaxWarmupMin <= 0 {
+		cfg.Client.ParallaxWarmupMin = 32 * 1024
+	}
+	if cfg.Client.ParallaxWarmupMax < cfg.Client.ParallaxWarmupMin {
+		cfg.Client.ParallaxWarmupMax = 64 * 1024
+	}
+	if cfg.Server.ParallaxStallSec <= 0 {
+		cfg.Server.ParallaxStallSec = 4
+	}
+	if cfg.Client.ParallaxStallSec <= 0 {
+		cfg.Client.ParallaxStallSec = 4
+	}
+
+	// Phase 3: Failover defaults
+	if len(cfg.Server.FailoverTransports) == 0 {
+		cfg.Server.FailoverTransports = []string{"tlsmux", "xhttpsmux", "parallaxmux"}
+	}
+	if len(cfg.Client.FailoverTransports) == 0 {
+		cfg.Client.FailoverTransports = []string{"tlsmux", "xhttpsmux", "parallaxmux"}
+	}
+	if cfg.Server.FailoverProbeSec <= 0 {
+		cfg.Server.FailoverProbeSec = 5
+	}
+	if cfg.Server.FailoverRestoreSec <= 0 {
+		cfg.Server.FailoverRestoreSec = 300
+	}
+
+	// Phase 3: Game Mode defaults
+	if cfg.Server.GameCopies < 1 {
+		cfg.Server.GameCopies = 3
+	} else if cfg.Server.GameCopies > 4 {
+		cfg.Server.GameCopies = 4
+	}
+	if cfg.Client.GameCopies < 1 {
+		cfg.Client.GameCopies = 3
+	} else if cfg.Client.GameCopies > 4 {
+		cfg.Client.GameCopies = 4
+	}
+	if cfg.Server.GameMode && cfg.Server.KCPMode == defaultKCPMode {
+		cfg.Server.KCPMode = "fast3"
+	}
+	if cfg.Client.GameMode && cfg.Client.KCPMode == defaultKCPMode {
+		cfg.Client.KCPMode = "fast3"
+	}
 }

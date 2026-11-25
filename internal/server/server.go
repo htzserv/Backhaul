@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"strings"
+	"strconv"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"time"
@@ -15,10 +18,18 @@ import (
 )
 
 type Server struct {
-	config *config.ServerConfig
-	ctx    context.Context
-	cancel context.CancelFunc
-	logger *logrus.Logger
+	config    *config.ServerConfig
+	ctx       context.Context
+	cancel    context.CancelFunc
+	logger    *logrus.Logger
+	statusPtr *string
+}
+
+func (s *Server) IsConnected() bool {
+	if s == nil || s.statusPtr == nil {
+		return false
+	}
+	return strings.HasPrefix(*s.statusPtr, "Connected")
 }
 
 func NewServer(cfg *config.ServerConfig, parentCtx context.Context) *Server {
@@ -37,6 +48,22 @@ func (s *Server) Start() {
 			s.logger.Info("pprof started at port 6060")
 			http.ListenAndServe("0.0.0.0:6060", nil)
 		}()
+	}
+
+	if s.config.GameMode && len(s.config.GamePorts) > 0 {
+		bh, bp, _ := net.SplitHostPort(s.config.BindAddr)
+		gBase := s.config.GameBasePort
+		if gBase <= 0 {
+			p, _ := strconv.Atoi(bp)
+			gBase = p + 10
+		}
+		go network.StartGameModeServer(s.ctx, network.GameModeConfig{
+			Token:    s.config.Token,
+			BindHost: bh,
+			BasePort: gBase,
+			Copies:   s.config.GameCopies,
+			Ports:    s.config.GamePorts,
+		}, s.logger)
 	}
 
 	switch s.config.Transport {
@@ -58,6 +85,7 @@ func (s *Server) Start() {
 			SO_SNDBUF:     s.config.SO_SNDBUF,
 			ProxyProtocol: s.config.ProxyProtocol,
 		}
+		s.statusPtr = &tcpConfig.TunnelStatus
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)
 		go tcpServer.Start()
 
@@ -83,6 +111,7 @@ func (s *Server) Start() {
 			SO_SNDBUF:        s.config.SO_SNDBUF,
 			ProxyProtocol:    s.config.ProxyProtocol,
 		}
+		s.statusPtr = &tcpMuxConfig.TunnelStatus
 		tcpMuxServer := transport.NewTcpMuxServer(s.ctx, tcpMuxConfig, s.logger)
 		go tcpMuxServer.Start()
 
@@ -112,6 +141,7 @@ func (s *Server) Start() {
 			SO_SNDBUF:        s.config.SO_SNDBUF,
 			ProxyProtocol:    s.config.ProxyProtocol,
 		}
+		s.statusPtr = &tlsCfg.TunnelStatus
 		tlsServer := transport.NewTLSServer(s.ctx, tlsCfg, s.logger)
 		go tlsServer.Start()
 
@@ -132,6 +162,7 @@ func (s *Server) Start() {
 			TLSKeyFile:  s.config.TLSKeyFile,
 			SNI:         s.config.SNI,
 		}
+		s.statusPtr = &wsConfig.TunnelStatus
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
 		go wsServer.Start()
 
@@ -158,6 +189,7 @@ func (s *Server) Start() {
 			SNI:              s.config.SNI,
 			ProxyProtocol:    s.config.ProxyProtocol,
 		}
+		s.statusPtr = &wsMuxConfig.TunnelStatus
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
 		go wsMuxServer.Start()
 
@@ -172,6 +204,7 @@ func (s *Server) Start() {
 			WebPort:     s.config.WebPort,
 			SnifferLog:  s.config.SnifferLog,
 		}
+		s.statusPtr = &udpConfig.TunnelStatus
 		udpServer := transport.NewUDPServer(s.ctx, udpConfig, s.logger)
 		go udpServer.Start()
 
@@ -211,6 +244,7 @@ func (s *Server) Start() {
 				SO_SNDBUF:   s.config.SO_SNDBUF,
 			},
 		}
+		s.statusPtr = &kcpCfg.TunnelStatus
 		kcpServer := transport.NewKCPServer(s.ctx, kcpCfg, s.logger)
 		go kcpServer.Start()
 
@@ -238,8 +272,58 @@ func (s *Server) Start() {
 			FallbackAddr:     s.config.FallbackAddr,
 			XHTTPPath:        s.config.XHTTPPath,
 		}
+		s.statusPtr = &xhttpCfg.TunnelStatus
 		xhttpServer := transport.NewXHTTPServer(s.ctx, xhttpCfg, s.logger)
 		go xhttpServer.Start()
+
+	case config.PARALLAX, config.PARALLAXMUX:
+		pxCfg := &transport.ParallaxServerConfig{
+			BindAddr:         s.config.BindAddr,
+			Token:            s.config.Token,
+			SnifferLog:       s.config.SnifferLog,
+			Ports:            s.config.Ports,
+			Nodelay:          s.config.Nodelay,
+			Sniffer:          s.config.Sniffer,
+			Mux:              s.config.Transport == config.PARALLAXMUX,
+			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
+			ChannelSize:      s.config.ChannelSize,
+			MuxCon:           s.config.MuxCon,
+			MuxVersion:       s.config.MuxVersion,
+			MaxFrameSize:     s.config.MaxFrameSize,
+			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  s.config.MaxStreamBuffer,
+			WebPort:          s.config.WebPort,
+			ProxyProtocol:    s.config.ProxyProtocol,
+			Parallax: network.ParallaxParams{
+				Token:     s.config.Token,
+				Lanes:     s.config.ParallaxLanes,
+				WarmupMin: s.config.ParallaxWarmupMin,
+				WarmupMax: s.config.ParallaxWarmupMax,
+				StallSec:  s.config.ParallaxStallSec,
+				KeepAlive: time.Duration(s.config.Keepalive) * time.Second,
+				NoDelay:   s.config.Nodelay,
+				KCP: network.KCPParams{
+					Mode:        s.config.KCPMode,
+					Key:         s.config.KCPKey,
+					Crypt:       s.config.KCPCrypt,
+					DataShard:   s.config.KCPDataShard,
+					ParityShard: s.config.KCPParityShard,
+					MTU:         s.config.KCPMTU,
+					SndWnd:      s.config.KCPSndWnd,
+					RcvWnd:      s.config.KCPRcvWnd,
+					AckNoDelay:  s.config.KCPAcksNoDelay,
+					SO_RCVBUF:   s.config.SO_RCVBUF,
+					SO_SNDBUF:   s.config.SO_SNDBUF,
+				},
+			},
+		}
+		s.statusPtr = &pxCfg.TunnelStatus
+		pxServer := transport.NewParallaxServer(s.ctx, pxCfg, s.logger)
+		go pxServer.Start()
+
+	case config.FAILOVER:
+		go s.startFailover()
 
 	default:
 		s.logger.Fatal("invalid transport type: ", s.config.Transport)

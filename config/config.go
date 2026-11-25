@@ -4,21 +4,24 @@ package config
 type TransportType string
 
 const (
-	TCP       TransportType = "tcp"
-	TCPMUX    TransportType = "tcpmux"
-	TLS       TransportType = "tls"
-	TLSMUX    TransportType = "tlsmux"
-	WS        TransportType = "ws"
-	WSS       TransportType = "wss"
-	WSMUX     TransportType = "wsmux"
-	WSSMUX    TransportType = "wssmux"
-	UDP       TransportType = "udp"
-	KCP       TransportType = "kcp"
-	KCPMUX    TransportType = "kcpmux"
-	XHTTP     TransportType = "xhttp"
-	XHTTPS    TransportType = "xhttps"
-	XHTTPMUX  TransportType = "xhttpmux"
-	XHTTPSMUX TransportType = "xhttpsmux"
+	TCP         TransportType = "tcp"
+	TCPMUX      TransportType = "tcpmux"
+	TLS         TransportType = "tls"
+	TLSMUX      TransportType = "tlsmux"
+	WS          TransportType = "ws"
+	WSS         TransportType = "wss"
+	WSMUX       TransportType = "wsmux"
+	WSSMUX      TransportType = "wssmux"
+	UDP         TransportType = "udp"
+	KCP         TransportType = "kcp"
+	KCPMUX      TransportType = "kcpmux"
+	XHTTP       TransportType = "xhttp"
+	XHTTPS      TransportType = "xhttps"
+	XHTTPMUX    TransportType = "xhttpmux"
+	XHTTPSMUX   TransportType = "xhttpsmux"
+	PARALLAX    TransportType = "parallax"
+	PARALLAXMUX TransportType = "parallaxmux"
+	FAILOVER    TransportType = "failover"
 )
 
 type ServerConfig struct {
@@ -74,6 +77,24 @@ type ServerConfig struct {
 	XHTTPHost   string `toml:"xhttp_host"`
 	XHTTPMode   string `toml:"xhttp_mode"`
 	TLSFragment bool   `toml:"tls_fragment"`
+
+	// Phase 3: Parallax (Multi-Lane TCP + KCP/FEC)
+	ParallaxLanes     int `toml:"parallax_lanes"`
+	ParallaxWarmupMin int `toml:"parallax_warmup_min"`
+	ParallaxWarmupMax int `toml:"parallax_warmup_max"`
+	ParallaxStallSec  int `toml:"parallax_stall_sec"`
+
+	// Phase 3: Multi-Transport Failover
+	FailoverTransports []string `toml:"failover_transports"`
+	FailoverBasePort   int      `toml:"failover_base_port"`
+	FailoverProbeSec   int      `toml:"failover_probe_sec"`
+	FailoverRestoreSec int      `toml:"failover_restore_sec"`
+
+	// Phase 3: Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
+	GameMode     bool     `toml:"game_mode"`
+	GameCopies   int      `toml:"game_copies"`
+	GameBasePort int      `toml:"game_base_port"`
+	GamePorts    []string `toml:"game_ports"`
 }
 
 type ClientConfig struct {
@@ -126,6 +147,24 @@ type ClientConfig struct {
 	XHTTPHost   string `toml:"xhttp_host"`
 	XHTTPMode   string `toml:"xhttp_mode"`
 	TLSFragment bool   `toml:"tls_fragment"`
+
+	// Phase 3: Parallax (Multi-Lane TCP + KCP/FEC)
+	ParallaxLanes     int `toml:"parallax_lanes"`
+	ParallaxWarmupMin int `toml:"parallax_warmup_min"`
+	ParallaxWarmupMax int `toml:"parallax_warmup_max"`
+	ParallaxStallSec  int `toml:"parallax_stall_sec"`
+
+	// Phase 3: Multi-Transport Failover
+	FailoverTransports []string `toml:"failover_transports"`
+	FailoverBasePort   int      `toml:"failover_base_port"`
+	FailoverProbeSec   int      `toml:"failover_probe_sec"`
+	FailoverRestoreSec int      `toml:"failover_restore_sec"`
+
+	// Phase 3: Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
+	GameMode     bool     `toml:"game_mode"`
+	GameCopies   int      `toml:"game_copies"`
+	GameBasePort int      `toml:"game_base_port"`
+	GamePorts    []string `toml:"game_ports"`
 }
 
 type Config struct {
