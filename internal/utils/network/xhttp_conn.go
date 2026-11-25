@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -28,13 +31,6 @@ var xhttpBufPool = sync.Pool{
 	},
 }
 
-var xhttpPacketPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 64*1024)
-		return &b
-	},
-}
-
 type XHTTPDialConfig struct {
 	RemoteAddr      string
 	EdgeIP          string
@@ -45,6 +41,7 @@ type XHTTPDialConfig struct {
 	Mode            string
 	Token           string
 	UTLSFingerprint string
+	TLSFragment     bool
 	TLS             bool
 	DialTimeout     time.Duration
 	KeepAlive       time.Duration
@@ -90,7 +87,7 @@ func NewXHTTPSharedClients(cfg XHTTPDialConfig) (*XHTTPSharedClients, error) {
 				}
 				hsCtx, cancel := context.WithTimeout(dCtx, cfg.DialTimeout)
 				defer cancel()
-				return DialUTLS(hsCtx, raw, sniHost, cfg.UTLSFingerprint, []string{"h2"})
+				return DialUTLSFragmented(hsCtx, raw, sniHost, cfg.UTLSFingerprint, []string{"h2"}, cfg.TLSFragment)
 			},
 			ReadIdleTimeout: 30 * time.Second,
 			PingTimeout:     15 * time.Second,
@@ -105,7 +102,7 @@ func NewXHTTPSharedClients(cfg XHTTPDialConfig) (*XHTTPSharedClients, error) {
 				}
 				hsCtx, cancel := context.WithTimeout(dCtx, cfg.DialTimeout)
 				defer cancel()
-				return DialUTLS(hsCtx, raw, sniHost, cfg.UTLSFingerprint, []string{"http/1.1"})
+				return DialUTLSFragmented(hsCtx, raw, sniHost, cfg.UTLSFingerprint, []string{"http/1.1"}, cfg.TLSFragment)
 			},
 			MaxIdleConns:        64,
 			MaxIdleConnsPerHost: 32,
@@ -332,6 +329,7 @@ func DialXHTTP(parentCtx context.Context, cfg XHTTPDialConfig) (net.Conn, error)
 			}
 		}()
 	} else {
+		// Pipelined parallel packet-up workers (4 concurrent HTTP POSTs)
 		xc.upCh = make(chan xhttpPacket, 64)
 		for i := 0; i < 4; i++ {
 			go xc.packetUpWorker()
@@ -702,11 +700,11 @@ func (s *serverXHTTPSession) pushOrderedPacket(seq uint64, data []byte) error {
 }
 
 type XHTTPServerHandler struct {
-	token        string
-	basePath     string
-	bindAddr     string
-	fallbackAddr string
-	onAccept     func(purpose string, conn net.Conn)
+	token         string
+	basePath      string
+	bindAddr      string
+	fallbackProxy *httputil.ReverseProxy
+	onAccept      func(purpose string, conn net.Conn)
 
 	mu       sync.Mutex
 	sessions map[string]*serverXHTTPSession
@@ -717,16 +715,43 @@ func NewXHTTPServerHandler(ctx context.Context, bindAddr, basePath, token, fallb
 		basePath = "/api/v1/stream"
 	}
 	basePath = "/" + strings.Trim(basePath, "/")
+
+	var fbProxy *httputil.ReverseProxy
+	fb := strings.TrimSpace(fallbackAddr)
+	if fb != "" {
+		if !strings.HasPrefix(fb, "http://") && !strings.HasPrefix(fb, "https://") {
+			fb = "http://" + fb
+		}
+		if u, err := url.Parse(fb); err == nil && u.Host != "" {
+			fbProxy = httputil.NewSingleHostReverseProxy(u)
+			fbProxy.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+		}
+	}
+
 	h := &XHTTPServerHandler{
-		token:        token,
-		basePath:     basePath,
-		bindAddr:     bindAddr,
-		fallbackAddr: strings.TrimSpace(fallbackAddr),
-		onAccept:     onAccept,
-		sessions:     make(map[string]*serverXHTTPSession),
+		token:         token,
+		basePath:      basePath,
+		bindAddr:      bindAddr,
+		fallbackProxy: fbProxy,
+		onAccept:      onAccept,
+		sessions:      make(map[string]*serverXHTTPSession),
 	}
 	go h.reapStaleSessions(ctx)
 	return h2c.NewHandler(h, &http2.Server{})
+}
+
+func (h *XHTTPServerHandler) serveFallback(w http.ResponseWriter, r *http.Request) {
+	if h.fallbackProxy != nil {
+		h.fallbackProxy.ServeHTTP(w, r)
+		return
+	}
+	// Active-probe resistance: brief randomized delay before generic 404
+	time.Sleep(time.Duration(40+mrand.Intn(120)) * time.Millisecond)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte("<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center></body></html>"))
 }
 
 func (h *XHTTPServerHandler) reapStaleSessions(ctx context.Context) {
@@ -778,28 +803,21 @@ func (h *XHTTPServerHandler) removeSession(id string) {
 }
 
 func (h *XHTTPServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "Bearer "+h.token {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("<html><body><h1>404 Not Found</h1></body></html>"))
-		return
-	}
-
-	if !strings.HasPrefix(r.URL.Path, h.basePath+"/") {
-		http.NotFound(w, r)
+	if r.Header.Get("Authorization") != "Bearer "+h.token || !strings.HasPrefix(r.URL.Path, h.basePath+"/") {
+		h.serveFallback(w, r)
 		return
 	}
 
 	rel := strings.TrimPrefix(r.URL.Path, h.basePath+"/")
 	parts := strings.Split(rel, "/")
 	if len(parts) < 2 || len(parts) > 3 {
-		http.NotFound(w, r)
+		h.serveFallback(w, r)
 		return
 	}
 	purpose := parts[0]
 	sessionID := parts[1]
 	if (purpose != "channel" && purpose != "tunnel") || sessionID == "" {
-		http.NotFound(w, r)
+		h.serveFallback(w, r)
 		return
 	}
 

@@ -8,9 +8,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	mrand "math/rand"
 	"net"
 	"strings"
 	"time"
@@ -176,18 +178,62 @@ func DialUTLS(ctx context.Context, rawConn net.Conn, sni, fingerprint string, ne
 	return uConn, nil
 }
 
-type fragmentingConn struct {
+// tlsRecordFragmentConn splits the initial TLS ClientHello handshake record
+// into multiple standard RFC-5246/8446 TLS handshake records sent in separate
+// TCP segments with small random delays so SNI-reading DPIs cannot parse it,
+// while every standard TLS server transparently reassembles it.
+type tlsRecordFragmentConn struct {
 	net.Conn
 	firstWriteDone bool
 }
 
-func (f *fragmentingConn) Write(p []byte) (int, error) {
-	if f.firstWriteDone || len(p) <= 24 {
+func (f *tlsRecordFragmentConn) Write(p []byte) (int, error) {
+	if f.firstWriteDone || len(p) <= 40 {
 		f.firstWriteDone = true
 		return f.Conn.Write(p)
 	}
 	f.firstWriteDone = true
-	splitAt := 12 + int(p[0]%16)
+
+	// Check if p begins with a complete TLS Handshake record (0x16, major, minor, lenHi, lenLo)
+	if p[0] == 0x16 && len(p) >= 5 {
+		recLen := int(binary.BigEndian.Uint16(p[3:5]))
+		if recLen > 0 && 5+recLen <= len(p) {
+			major, minor := p[1], p[2]
+			payload := p[5 : 5+recLen]
+			tail := p[5+recLen:]
+
+			offset := 0
+			for offset < len(payload) {
+				chunkSize := 16 + mrand.Intn(33) // 16..48 bytes per TLS record
+				if offset+chunkSize > len(payload) {
+					chunkSize = len(payload) - offset
+				}
+				rec := make([]byte, 5+chunkSize)
+				rec[0] = 0x16
+				rec[1] = major
+				rec[2] = minor
+				binary.BigEndian.PutUint16(rec[3:5], uint16(chunkSize))
+				copy(rec[5:], payload[offset:offset+chunkSize])
+
+				if _, err := f.Conn.Write(rec); err != nil {
+					return offset, err
+				}
+				offset += chunkSize
+				if offset < len(payload) {
+					time.Sleep(time.Duration(1+mrand.Intn(4)) * time.Millisecond)
+				}
+			}
+			if len(tail) > 0 {
+				if _, err := f.Conn.Write(tail); err != nil {
+					return 5 + recLen, err
+				}
+			}
+			return len(p), nil
+		}
+	}
+
+	// Fallback TCP-level split if not a single TLS handshake record
+	splitAt := 16 + mrand.Intn(24)
 	if splitAt >= len(p) {
 		splitAt = len(p) / 2
 	}
@@ -204,5 +250,5 @@ func DialUTLSFragmented(ctx context.Context, rawConn net.Conn, sni, fingerprint 
 	if !fragment {
 		return DialUTLS(ctx, rawConn, sni, fingerprint, nextProtos)
 	}
-	return DialUTLS(ctx, &fragmentingConn{Conn: rawConn}, sni, fingerprint, nextProtos)
+	return DialUTLS(ctx, &tlsRecordFragmentConn{Conn: rawConn}, sni, fingerprint, nextProtos)
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/musix/backhaul/config"
 )
 
-func WebSocketDialer(ctx context.Context, addr string, edgeIP string, sni string, fingerprint string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
+func WebSocketDialer(ctx context.Context, addr string, edgeIP string, sni string, fingerprint string, tlsFragment bool, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
 	var tunnelWSConn *websocket.Conn
 	var err error
 
@@ -24,7 +24,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, sni string
 	backoff := 1 * time.Second
 
 	for i := 0; i < retries; i++ {
-		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, sni, fingerprint, path, timeout, keepalive, nodelay, token, mode, SO_RCVBUF, SO_SNDBUF)
+		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, sni, fingerprint, tlsFragment, path, timeout, keepalive, nodelay, token, mode, SO_RCVBUF, SO_SNDBUF)
 		if err == nil {
 			return tunnelWSConn, nil
 		}
@@ -38,7 +38,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, sni string
 	return nil, err
 }
 
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, sni string, fingerprint string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
+func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, sni string, fingerprint string, tlsFragment bool, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
 	randomUserID := rand.Int31()
 
 	userAgents := []string{
@@ -101,7 +101,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, sni s
 				}
 				hsCtx, cancel := context.WithTimeout(dCtx, timeout)
 				defer cancel()
-				return DialUTLS(hsCtx, raw, sni, fingerprint, []string{"http/1.1"})
+				return DialUTLSFragmented(hsCtx, raw, sni, fingerprint, []string{"http/1.1"}, tlsFragment)
 			},
 		}
 	default:

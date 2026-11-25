@@ -27,7 +27,7 @@ jobs:
         id: build
         run: |
           VER=$(sed -nE 's/.*const version = "([^"]*)".*/\1/p' main.go | head -n1)
-          [ -n "$VER" ] || VER="v0.9.2"
+          [ -n "$VER" ] || VER="v0.9.3"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           go mod tidy
           go vet ./...

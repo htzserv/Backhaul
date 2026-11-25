@@ -9,6 +9,7 @@ import (
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/server/transport"
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/network"
 
 	"github.com/sirupsen/logrus"
 )
@@ -31,7 +32,6 @@ func NewServer(cfg *config.ServerConfig, parentCtx context.Context) *Server {
 }
 
 func (s *Server) Start() {
-	// for pprof and debugging
 	if s.config.PPROF {
 		go func() {
 			s.logger.Info("pprof started at port 6060")
@@ -58,7 +58,6 @@ func (s *Server) Start() {
 			SO_SNDBUF:     s.config.SO_SNDBUF,
 			ProxyProtocol: s.config.ProxyProtocol,
 		}
-
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)
 		go tcpServer.Start()
 
@@ -84,9 +83,37 @@ func (s *Server) Start() {
 			SO_SNDBUF:        s.config.SO_SNDBUF,
 			ProxyProtocol:    s.config.ProxyProtocol,
 		}
-
 		tcpMuxServer := transport.NewTcpMuxServer(s.ctx, tcpMuxConfig, s.logger)
 		go tcpMuxServer.Start()
+
+	case config.TLS, config.TLSMUX:
+		tlsCfg := &transport.TlsServerConfig{
+			BindAddr:         s.config.BindAddr,
+			Token:            s.config.Token,
+			SnifferLog:       s.config.SnifferLog,
+			TLSCertFile:      s.config.TLSCertFile,
+			TLSKeyFile:       s.config.TLSKeyFile,
+			SNI:              s.config.SNI,
+			Ports:            s.config.Ports,
+			Nodelay:          s.config.Nodelay,
+			Sniffer:          s.config.Sniffer,
+			Mux:              s.config.Transport == config.TLSMUX,
+			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
+			ChannelSize:      s.config.ChannelSize,
+			MuxCon:           s.config.MuxCon,
+			MuxVersion:       s.config.MuxVersion,
+			MaxFrameSize:     s.config.MaxFrameSize,
+			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  s.config.MaxStreamBuffer,
+			WebPort:          s.config.WebPort,
+			MSS:              s.config.MSS,
+			SO_RCVBUF:        s.config.SO_RCVBUF,
+			SO_SNDBUF:        s.config.SO_SNDBUF,
+			ProxyProtocol:    s.config.ProxyProtocol,
+		}
+		tlsServer := transport.NewTLSServer(s.ctx, tlsCfg, s.logger)
+		go tlsServer.Start()
 
 	case config.WS, config.WSS:
 		wsConfig := &transport.WsConfig{
@@ -103,8 +130,8 @@ func (s *Server) Start() {
 			Mode:        s.config.Transport,
 			TLSCertFile: s.config.TLSCertFile,
 			TLSKeyFile:  s.config.TLSKeyFile,
+			SNI:         s.config.SNI,
 		}
-
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
 		go wsServer.Start()
 
@@ -128,9 +155,9 @@ func (s *Server) Start() {
 			Mode:             s.config.Transport,
 			TLSCertFile:      s.config.TLSCertFile,
 			TLSKeyFile:       s.config.TLSKeyFile,
+			SNI:              s.config.SNI,
 			ProxyProtocol:    s.config.ProxyProtocol,
 		}
-
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
 		go wsMuxServer.Start()
 
@@ -145,23 +172,83 @@ func (s *Server) Start() {
 			WebPort:     s.config.WebPort,
 			SnifferLog:  s.config.SnifferLog,
 		}
-
 		udpServer := transport.NewUDPServer(s.ctx, udpConfig, s.logger)
 		go udpServer.Start()
+
+	case config.KCP, config.KCPMUX:
+		kcpCfg := &transport.KcpServerConfig{
+			BindAddr:         s.config.BindAddr,
+			Token:            s.config.Token,
+			SnifferLog:       s.config.SnifferLog,
+			Ports:            s.config.Ports,
+			Sniffer:          s.config.Sniffer,
+			Mux:              s.config.Transport == config.KCPMUX,
+			MuxCon:           s.config.MuxCon,
+			MuxVersion:       s.config.MuxVersion,
+			MaxFrameSize:     s.config.MaxFrameSize,
+			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  s.config.MaxStreamBuffer,
+			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
+			ChannelSize:      s.config.ChannelSize,
+			WebPort:          s.config.WebPort,
+			ProxyProtocol:    s.config.ProxyProtocol,
+			KCP: network.KCPParams{
+				Mode:        s.config.KCPMode,
+				Key:         s.config.KCPKey,
+				Crypt:       s.config.KCPCrypt,
+				DataShard:   s.config.KCPDataShard,
+				ParityShard: s.config.KCPParityShard,
+				MTU:         s.config.KCPMTU,
+				SndWnd:      s.config.KCPSndWnd,
+				RcvWnd:      s.config.KCPRcvWnd,
+				NoDelay:     s.config.KCPNoDelay,
+				Interval:    s.config.KCPInterval,
+				Resend:      s.config.KCPResend,
+				NC:          s.config.KCPNC,
+				AckNoDelay:  s.config.KCPAcksNoDelay,
+				DSCP:        s.config.KCPDSCP,
+				SO_RCVBUF:   s.config.SO_RCVBUF,
+				SO_SNDBUF:   s.config.SO_SNDBUF,
+			},
+		}
+		kcpServer := transport.NewKCPServer(s.ctx, kcpCfg, s.logger)
+		go kcpServer.Start()
+
+	case config.XHTTP, config.XHTTPS, config.XHTTPMUX, config.XHTTPSMUX:
+		xhttpCfg := &transport.XhttpServerConfig{
+			BindAddr:         s.config.BindAddr,
+			Token:            s.config.Token,
+			SnifferLog:       s.config.SnifferLog,
+			TLSCertFile:      s.config.TLSCertFile,
+			TLSKeyFile:       s.config.TLSKeyFile,
+			SNI:              s.config.SNI,
+			Ports:            s.config.Ports,
+			Sniffer:          s.config.Sniffer,
+			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
+			ChannelSize:      s.config.ChannelSize,
+			MuxCon:           s.config.MuxCon,
+			MuxVersion:       s.config.MuxVersion,
+			MaxFrameSize:     s.config.MaxFrameSize,
+			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  s.config.MaxStreamBuffer,
+			WebPort:          s.config.WebPort,
+			Mode:             s.config.Transport,
+			ProxyProtocol:    s.config.ProxyProtocol,
+			FallbackAddr:     s.config.FallbackAddr,
+			XHTTPPath:        s.config.XHTTPPath,
+		}
+		xhttpServer := transport.NewXHTTPServer(s.ctx, xhttpCfg, s.logger)
+		go xhttpServer.Start()
 
 	default:
 		s.logger.Fatal("invalid transport type: ", s.config.Transport)
 	}
 
 	<-s.ctx.Done()
-
 	s.logger.Info("all workers stopped successfully")
-
-	// suppress other logs
-	s.logger.SetLevel(logrus.FatalLevel)
 }
 
-// Stop shuts down the server gracefully
 func (s *Server) Stop() {
 	if s.cancel != nil {
 		s.cancel()

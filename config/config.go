@@ -1,5 +1,6 @@
 package config
 
+// TransportType defines the type of transport.
 type TransportType string
 
 const (
@@ -51,6 +52,7 @@ type ServerConfig struct {
 	ProxyProtocol    bool          `toml:"proxy_protocol"`
 	FallbackAddr     string        `toml:"fallback_addr"`
 
+	// KCP options
 	KCPMode        string `toml:"kcp_mode"`
 	KCPKey         string `toml:"kcp_key"`
 	KCPCrypt       string `toml:"kcp_crypt"`
@@ -67,6 +69,7 @@ type ServerConfig struct {
 	KCPAcksNoDelay bool   `toml:"kcp_acknodelay"`
 	KCPDSCP        int    `toml:"kcp_dscp"`
 
+	// XHTTP & Anti-DPI options
 	XHTTPPath   string `toml:"xhttp_path"`
 	XHTTPHost   string `toml:"xhttp_host"`
 	XHTTPMode   string `toml:"xhttp_mode"`
@@ -101,6 +104,7 @@ type ClientConfig struct {
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 
+	// KCP options
 	KCPMode        string `toml:"kcp_mode"`
 	KCPKey         string `toml:"kcp_key"`
 	KCPCrypt       string `toml:"kcp_crypt"`
@@ -117,6 +121,7 @@ type ClientConfig struct {
 	KCPAcksNoDelay bool   `toml:"kcp_acknodelay"`
 	KCPDSCP        int    `toml:"kcp_dscp"`
 
+	// XHTTP & Anti-DPI options
 	XHTTPPath   string `toml:"xhttp_path"`
 	XHTTPHost   string `toml:"xhttp_host"`
 	XHTTPMode   string `toml:"xhttp_mode"`

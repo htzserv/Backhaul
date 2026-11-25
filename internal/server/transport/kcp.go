@@ -139,16 +139,17 @@ func (s *KcpServerTransport) Restart() {
 	defer s.restartMutex.Unlock()
 
 	s.logger.Infof("restarting %s server...", s.modeLabel())
-	level := s.logger.Level
-	s.logger.SetLevel(logrus.FatalLevel)
-
+	// Send Farewell goodbye before closing KCP session so peer reconnects immediately
+	if cc := s.getControl(); cc != nil {
+		_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+		_ = utils.SendBinaryByte(cc, utils.SG_Closed)
+		time.Sleep(50 * time.Millisecond)
+		_ = cc.Close()
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
-	if cc := s.getControl(); cc != nil {
-		cc.Close()
-	}
-	time.Sleep(2 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(s.parentctx)
 	s.ctx = ctx
@@ -159,18 +160,30 @@ func (s *KcpServerTransport) Restart() {
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.setControl(nil)
-	s.streamCounter = 0
-	s.sessionCounter = 0
+	atomic.StoreInt32(&s.streamCounter, 0)
+	atomic.StoreInt32(&s.sessionCounter, 0)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.logger.SetLevel(level)
 
 	go s.Start()
 }
 
 func (s *KcpServerTransport) tunnelListener() {
-	listener, err := network.ListenKCP(s.config.BindAddr, s.config.KCP)
+	var listener *kcp.Listener
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		listener, err = network.ListenKCP(s.config.BindAddr, s.config.KCP)
+		if err == nil {
+			break
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 	if err != nil {
-		s.logger.Fatalf("failed to start KCP listener on %s: %v", s.config.BindAddr, err)
+		s.logger.Errorf("failed to start KCP listener on %s: %v", s.config.BindAddr, err)
+		go s.Restart()
 		return
 	}
 	defer listener.Close()
@@ -288,8 +301,8 @@ func (s *KcpServerTransport) channelHandler() {
 				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
 				msg, err := utils.ReceiveBinaryByte(cc)
 				if err != nil {
-					if s.cancel != nil {
-						s.logger.Error("failed to read from KCP control channel: ", err)
+					if s.ctx.Err() == nil {
+						s.logger.Warnf("KCP control channel closed: %v", err)
 						go s.Restart()
 					}
 					return
@@ -302,6 +315,7 @@ func (s *KcpServerTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
 			_ = utils.SendBinaryByte(cc, utils.SG_Closed)
 			return
 		case <-s.reqNewConnChan:
@@ -318,6 +332,7 @@ func (s *KcpServerTransport) channelHandler() {
 			switch msg {
 			case utils.SG_HB:
 			case utils.SG_Closed:
+				s.logger.Infof("received farewell goodbye from %s client, restarting...", s.modeLabel())
 				go s.Restart()
 				return
 			}
@@ -335,15 +350,18 @@ func (s *KcpServerTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+					continue
 				}
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port: %s", rangeParts[0])
+					continue
 				}
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port: %s", rangeParts[1])
+					continue
 				}
 				for port := startPort; port <= endPort; port++ {
 					go s.localListener(fmt.Sprintf(":%d", port), strconv.Itoa(port))
@@ -353,7 +371,8 @@ func (s *KcpServerTransport) parsePortMappings() {
 			}
 			port, err := strconv.Atoi(localPortOrRange)
 			if err != nil || port < 1 || port > 65535 {
-				s.logger.Fatalf("invalid port format: %s", localPortOrRange)
+				s.logger.Errorf("invalid port format: %s", localPortOrRange)
+				continue
 			}
 			localAddr = fmt.Sprintf(":%d", port)
 		} else if len(parts) == 2 {
@@ -362,15 +381,18 @@ func (s *KcpServerTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+					continue
 				}
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port: %s", rangeParts[0])
+					continue
 				}
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port: %s", rangeParts[1])
+					continue
 				}
 				for port := startPort; port <= endPort; port++ {
 					go s.localListener(fmt.Sprintf(":%d", port), remoteAddr)
@@ -385,16 +407,29 @@ func (s *KcpServerTransport) parsePortMappings() {
 				localAddr = localPortOrRange
 			}
 		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+			s.logger.Errorf("invalid port mapping format: %s", portMapping)
+			continue
 		}
 		go s.localListener(localAddr, remoteAddr)
 	}
 }
 
 func (s *KcpServerTransport) localListener(localAddr, remoteAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
+	var listener net.Listener
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		listener, err = net.Listen("tcp", localAddr)
+		if err == nil {
+			break
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
 	if err != nil {
-		s.logger.Fatalf("failed to listen on %s: %v", localAddr, err)
+		s.logger.Errorf("failed to listen on %s: %v", localAddr, err)
 		return
 	}
 	defer listener.Close()
@@ -456,7 +491,7 @@ func (s *KcpServerTransport) handleRawLoop() {
 						tunnelConn.Close()
 						continue loop
 					}
-					go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, tunnelConn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+					go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, tunnelConn, s.logger, s.usageMonitor, handlers.LocalPortOf(localConn.conn), s.config.Sniffer)
 					break loop
 				}
 			}
@@ -519,7 +554,7 @@ func (s *KcpServerTransport) handleMuxSession(session *smux.Session) {
 				continue
 			}
 			go func() {
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, handlers.LocalPortOf(incomingConn.conn), s.config.Sniffer)
 				atomic.AddInt32(&s.streamCounter, -1)
 				<-counter
 			}()

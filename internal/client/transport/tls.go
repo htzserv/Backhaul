@@ -22,6 +22,7 @@ type TlsClientConfig struct {
 	EdgeIP           string
 	SNI              string
 	UTLSFingerprint  string
+	TLSFragment      bool
 	Token            string
 	SnifferLog       string
 	TunnelStatus     string
@@ -50,6 +51,7 @@ type TlsClientTransport struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	logger          *logrus.Logger
+	controlMu       sync.RWMutex
 	controlChannel  net.Conn
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
@@ -86,6 +88,18 @@ func (c *TlsClientTransport) modeLabel() string {
 	return "TLS"
 }
 
+func (c *TlsClientTransport) getControl() net.Conn {
+	c.controlMu.RLock()
+	defer c.controlMu.RUnlock()
+	return c.controlChannel
+}
+
+func (c *TlsClientTransport) setControl(conn net.Conn) {
+	c.controlMu.Lock()
+	c.controlChannel = conn
+	c.controlMu.Unlock()
+}
+
 func (c *TlsClientTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
@@ -101,26 +115,24 @@ func (c *TlsClientTransport) Restart() {
 	defer c.restartMutex.Unlock()
 
 	c.logger.Infof("restarting %s client...", c.modeLabel())
-	level := c.logger.Level
-	c.logger.SetLevel(logrus.FatalLevel)
-
+	if cc := c.getControl(); cc != nil {
+		_ = cc.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = utils.SendBinaryByte(cc, utils.SG_Closed)
+		_ = cc.Close()
+	}
 	if c.cancel != nil {
 		c.cancel()
 	}
-	if c.controlChannel != nil {
-		c.controlChannel.Close()
-	}
-	time.Sleep(2 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(c.parentctx)
 	c.ctx = ctx
 	c.cancel = cancel
-	c.controlChannel = nil
+	c.setControl(nil)
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
-	c.poolConnections = 0
-	c.loadConnections = 0
+	atomic.StoreInt32(&c.poolConnections, 0)
+	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)
-	c.logger.SetLevel(level)
 
 	go c.Start()
 }
@@ -146,11 +158,11 @@ func (c *TlsClientTransport) dialTLS(nodelay bool, rcvBuf, sndBuf, mss int, retr
 	}
 	hsCtx, cancel := context.WithTimeout(c.ctx, c.config.DialTimeOut)
 	defer cancel()
-	return network.DialUTLS(hsCtx, rawConn, sni, c.config.UTLSFingerprint, []string{"http/1.1", "h2"})
+	return network.DialUTLSFragmented(hsCtx, rawConn, sni, c.config.UTLSFingerprint, []string{"http/1.1", "h2"}, c.config.TLSFragment)
 }
 
 func (c *TlsClientTransport) channelDialer() {
-	c.logger.Infof("attempting to establish %s control channel to %s (SNI=%s, uTLS=%s)...", c.modeLabel(), c.config.RemoteAddr, c.config.SNI, c.config.UTLSFingerprint)
+	c.logger.Infof("attempting to establish %s control channel to %s (SNI=%s, uTLS=%s, frag=%v)...", c.modeLabel(), c.config.RemoteAddr, c.config.SNI, c.config.UTLSFingerprint, c.config.TLSFragment)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -178,7 +190,7 @@ func (c *TlsClientTransport) channelDialer() {
 			}
 			_ = conn.SetReadDeadline(time.Time{})
 
-			c.controlChannel = conn
+			c.setControl(conn)
 			c.logger.Infof("%s control channel established successfully", c.modeLabel())
 			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.modeLabel())
 
@@ -231,6 +243,10 @@ func (c *TlsClientTransport) poolMaintainer() {
 }
 
 func (c *TlsClientTransport) channelHandler() {
+	cc := c.getControl()
+	if cc == nil {
+		return
+	}
 	msgChan := make(chan byte, 1000)
 	go func() {
 		for {
@@ -242,11 +258,11 @@ func (c *TlsClientTransport) channelHandler() {
 				if readTimeout < 120*time.Second {
 					readTimeout = 120 * time.Second
 				}
-				_ = c.controlChannel.SetReadDeadline(time.Now().Add(readTimeout))
-				msg, err := utils.ReceiveBinaryByte(c.controlChannel)
+				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
+				msg, err := utils.ReceiveBinaryByte(cc)
 				if err != nil {
-					if c.cancel != nil {
-						c.logger.Error("failed to read from TLS control channel: ", err)
+					if c.ctx.Err() == nil {
+						c.logger.Warnf("TLS control channel closed: %v", err)
 						go c.Restart()
 					}
 					return
@@ -259,7 +275,8 @@ func (c *TlsClientTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = utils.SendBinaryByte(c.controlChannel, utils.SG_Closed)
+			_ = cc.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = utils.SendBinaryByte(cc, utils.SG_Closed)
 			return
 		case msg := <-msgChan:
 			switch msg {
@@ -271,8 +288,9 @@ func (c *TlsClientTransport) channelHandler() {
 					go c.tunnelDialer()
 				}
 			case utils.SG_HB:
-				_ = utils.SendBinaryByte(c.controlChannel, utils.SG_HB)
+				_ = utils.SendBinaryByte(cc, utils.SG_HB)
 			case utils.SG_Closed:
+				c.logger.Infof("received farewell goodbye from %s server, reconnecting...", c.modeLabel())
 				go c.Restart()
 				return
 			default:

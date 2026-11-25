@@ -9,6 +9,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// WSNetConn wraps a *websocket.Conn as a standard RFC-6455 framed net.Conn
+// so smux can run cleanly behind CDNs (Cloudflare/Arvan/Nginx).
 type WSNetConn struct {
 	ws      *websocket.Conn
 	readMu  sync.Mutex

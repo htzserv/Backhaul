@@ -1,0 +1,528 @@
+package transport
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/web"
+	"github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
+	"golang.org/x/net/http2"
+)
+
+type XhttpServerConfig struct {
+	BindAddr         string
+	Token            string
+	SnifferLog       string
+	TLSCertFile      string
+	TLSKeyFile       string
+	SNI              string
+	TunnelStatus     string
+	Ports            []string
+	Sniffer          bool
+	KeepAlive        time.Duration
+	Heartbeat        time.Duration
+	ChannelSize      int
+	MuxCon           int
+	MuxVersion       int
+	MaxFrameSize     int
+	MaxReceiveBuffer int
+	MaxStreamBuffer  int
+	WebPort          int
+	Mode             config.TransportType
+	ProxyProtocol    bool
+	FallbackAddr     string
+	XHTTPPath        string
+}
+
+type XhttpServerTransport struct {
+	config         *XhttpServerConfig
+	smuxConfig     *smux.Config
+	parentctx      context.Context
+	ctx            context.Context
+	cancel         context.CancelFunc
+	logger         *logrus.Logger
+	rawChannel     chan net.Conn
+	muxChannel     chan *smux.Session
+	localChannel   chan LocalTCPConn
+	reqNewConnChan chan struct{}
+	controlMu      sync.RWMutex
+	controlChannel net.Conn
+	usageMonitor   *web.Usage
+	restartMutex   sync.Mutex
+	streamCounter  int32
+	sessionCounter int32
+}
+
+func NewXHTTPServer(parentCtx context.Context, cfg *XhttpServerConfig, logger *logrus.Logger) *XhttpServerTransport {
+	ctx, cancel := context.WithCancel(parentCtx)
+	return &XhttpServerTransport{
+		smuxConfig: &smux.Config{
+			Version:           cfg.MuxVersion,
+			KeepAliveInterval: 20 * time.Second,
+			KeepAliveTimeout:  40 * time.Second,
+			MaxFrameSize:      cfg.MaxFrameSize,
+			MaxReceiveBuffer:  cfg.MaxReceiveBuffer,
+			MaxStreamBuffer:   cfg.MaxStreamBuffer,
+		},
+		config:         cfg,
+		parentctx:      parentCtx,
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         logger,
+		rawChannel:     make(chan net.Conn, cfg.ChannelSize),
+		muxChannel:     make(chan *smux.Session, cfg.ChannelSize),
+		localChannel:   make(chan LocalTCPConn, cfg.ChannelSize),
+		reqNewConnChan: make(chan struct{}, cfg.ChannelSize),
+		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", cfg.WebPort), ctx, cfg.SnifferLog, cfg.Sniffer, &cfg.TunnelStatus, logger),
+	}
+}
+
+func (s *XhttpServerTransport) isMux() bool {
+	return s.config.Mode == config.XHTTPMUX || s.config.Mode == config.XHTTPSMUX
+}
+
+func (s *XhttpServerTransport) isTLS() bool {
+	return s.config.Mode == config.XHTTPS || s.config.Mode == config.XHTTPSMUX
+}
+
+func (s *XhttpServerTransport) getControl() net.Conn {
+	s.controlMu.RLock()
+	defer s.controlMu.RUnlock()
+	return s.controlChannel
+}
+
+func (s *XhttpServerTransport) setControl(c net.Conn) {
+	s.controlMu.Lock()
+	s.controlChannel = c
+	s.controlMu.Unlock()
+}
+
+func (s *XhttpServerTransport) Start() {
+	if s.config.WebPort > 0 {
+		go s.usageMonitor.Monitor()
+	}
+	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.config.Mode)
+	go s.tunnelListener()
+}
+
+func (s *XhttpServerTransport) Restart() {
+	if !s.restartMutex.TryLock() {
+		return
+	}
+	defer s.restartMutex.Unlock()
+
+	s.logger.Infof("restarting %s server...", s.config.Mode)
+	if cc := s.getControl(); cc != nil {
+		_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+		_ = utils.SendBinaryByte(cc, utils.SG_Closed)
+		_ = cc.Close()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(s.parentctx)
+	s.ctx = ctx
+	s.cancel = cancel
+	s.rawChannel = make(chan net.Conn, s.config.ChannelSize)
+	s.muxChannel = make(chan *smux.Session, s.config.ChannelSize)
+	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
+	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
+	s.setControl(nil)
+	atomic.StoreInt32(&s.streamCounter, 0)
+	atomic.StoreInt32(&s.sessionCounter, 0)
+	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
+
+	go s.Start()
+}
+
+func (s *XhttpServerTransport) tunnelListener() {
+	handler := network.NewXHTTPServerHandler(s.ctx, s.config.BindAddr, s.config.XHTTPPath, s.config.Token, s.config.FallbackAddr, func(purpose string, conn net.Conn) {
+		if purpose == "channel" {
+			if cc := s.getControl(); cc != nil {
+				s.logger.Warn("new xhttp control channel requested, triggering fast reconnect...")
+				cc.Close()
+				conn.Close()
+				go s.Restart()
+				return
+			}
+			s.setControl(conn)
+			s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+			s.logger.Infof("%s control channel established successfully", s.config.Mode)
+
+			numCPU := runtime.NumCPU()
+			if numCPU > 4 {
+				numCPU = 4
+			}
+			go s.channelHandler()
+			go s.parsePortMappings()
+			for i := 0; i < numCPU; i++ {
+				if s.isMux() {
+					go s.handleMuxLoop()
+				} else {
+					go s.handleRawLoop()
+				}
+			}
+			return
+		}
+
+		if s.getControl() == nil {
+			conn.Close()
+			return
+		}
+
+		if s.isMux() {
+			session, err := smux.Client(conn, s.smuxConfig)
+			if err != nil {
+				conn.Close()
+				return
+			}
+			select {
+			case s.muxChannel <- session:
+			default:
+				session.Close()
+			}
+		} else {
+			select {
+			case s.rawChannel <- conn:
+			default:
+				conn.Close()
+			}
+		}
+	})
+
+	srv := &http.Server{
+		Addr:        s.config.BindAddr,
+		Handler:     handler,
+		IdleTimeout: 0,
+	}
+
+	if s.isTLS() {
+		tlsCfg, err := network.LoadOrGenerateTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.SNI, []string{"h2", "http/1.1"})
+		if err != nil {
+			s.logger.Errorf("failed to load/generate TLS config for %s: %v", s.config.Mode, err)
+			return
+		}
+		srv.TLSConfig = tlsCfg
+		_ = http2.ConfigureServer(srv, &http2.Server{})
+		go func() {
+			s.logger.Infof("%s server starting on %s (path=%s, Auto-TLS=%v, fallback=%q)", s.config.Mode, s.config.BindAddr, s.config.XHTTPPath, s.config.TLSCertFile == "", s.config.FallbackAddr)
+			if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				s.logger.Errorf("failed to listen on %s: %v", s.config.BindAddr, err)
+			}
+		}()
+	} else {
+		go func() {
+			s.logger.Infof("%s server starting on %s (path=%s, fallback=%q)", s.config.Mode, s.config.BindAddr, s.config.XHTTPPath, s.config.FallbackAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				s.logger.Errorf("failed to listen on %s: %v", s.config.BindAddr, err)
+			}
+		}()
+	}
+
+	<-s.ctx.Done()
+	if cc := s.getControl(); cc != nil {
+		cc.Close()
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+	_ = srv.Close()
+}
+
+func (s *XhttpServerTransport) channelHandler() {
+	cc := s.getControl()
+	if cc == nil {
+		return
+	}
+	ticker := time.NewTicker(s.config.Heartbeat)
+	defer ticker.Stop()
+
+	messageChan := make(chan byte, 10)
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				readTimeout := s.config.Heartbeat*2 + 15*time.Second
+				if readTimeout < 30*time.Second {
+					readTimeout = 30 * time.Second
+				}
+				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
+				msg, err := utils.ReceiveBinaryByte(cc)
+				if err != nil {
+					if s.ctx.Err() == nil {
+						s.logger.Warnf("xhttp control channel closed: %v", err)
+						go s.Restart()
+					}
+					return
+				}
+				messageChan <- msg
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+			_ = utils.SendBinaryByte(cc, utils.SG_Closed)
+			return
+		case <-s.reqNewConnChan:
+			if err := utils.SendBinaryByte(cc, utils.SG_Chan); err != nil {
+				go s.Restart()
+				return
+			}
+		case <-ticker.C:
+			if err := utils.SendBinaryByte(cc, utils.SG_HB); err != nil {
+				go s.Restart()
+				return
+			}
+		case msg := <-messageChan:
+			switch msg {
+			case utils.SG_HB:
+			case utils.SG_Closed:
+				s.logger.Infof("received farewell goodbye from %s client, restarting...", s.config.Mode)
+				go s.Restart()
+				return
+			}
+		}
+	}
+}
+
+func (s *XhttpServerTransport) parsePortMappings() {
+	for _, portMapping := range s.config.Ports {
+		parts := strings.Split(portMapping, "=")
+		var localAddr, remoteAddr string
+		if len(parts) == 1 {
+			localPortOrRange := strings.TrimSpace(parts[0])
+			remoteAddr = localPortOrRange
+			if strings.Contains(localPortOrRange, "-") {
+				rangeParts := strings.Split(localPortOrRange, "-")
+				if len(rangeParts) != 2 {
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+					continue
+				}
+				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+				if err != nil || startPort < 1 || startPort > 65535 {
+					s.logger.Errorf("invalid start port: %s", rangeParts[0])
+					continue
+				}
+				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
+					s.logger.Errorf("invalid end port: %s", rangeParts[1])
+					continue
+				}
+				for port := startPort; port <= endPort; port++ {
+					go s.localListener(fmt.Sprintf(":%d", port), strconv.Itoa(port))
+					time.Sleep(1 * time.Millisecond)
+				}
+				continue
+			}
+			port, err := strconv.Atoi(localPortOrRange)
+			if err != nil || port < 1 || port > 65535 {
+				s.logger.Errorf("invalid port format: %s", localPortOrRange)
+				continue
+			}
+			localAddr = fmt.Sprintf(":%d", port)
+		} else if len(parts) == 2 {
+			localPortOrRange := strings.TrimSpace(parts[0])
+			remoteAddr = strings.TrimSpace(parts[1])
+			if strings.Contains(localPortOrRange, "-") {
+				rangeParts := strings.Split(localPortOrRange, "-")
+				if len(rangeParts) != 2 {
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+					continue
+				}
+				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+				if err != nil || startPort < 1 || startPort > 65535 {
+					s.logger.Errorf("invalid start port: %s", rangeParts[0])
+					continue
+				}
+				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
+					s.logger.Errorf("invalid end port: %s", rangeParts[1])
+					continue
+				}
+				for port := startPort; port <= endPort; port++ {
+					go s.localListener(fmt.Sprintf(":%d", port), remoteAddr)
+					time.Sleep(1 * time.Millisecond)
+				}
+				continue
+			}
+			port, err := strconv.Atoi(localPortOrRange)
+			if err == nil && port >= 1 && port <= 65535 {
+				localAddr = fmt.Sprintf(":%d", port)
+			} else {
+				localAddr = localPortOrRange
+			}
+		} else {
+			s.logger.Errorf("invalid port mapping format: %s", portMapping)
+			continue
+		}
+		go s.localListener(localAddr, remoteAddr)
+	}
+}
+
+func (s *XhttpServerTransport) localListener(localAddr, remoteAddr string) {
+	var listener net.Listener
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		listener, err = net.Listen("tcp", localAddr)
+		if err == nil {
+			break
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
+	if err != nil {
+		s.logger.Errorf("failed to listen on %s: %v", localAddr, err)
+		return
+	}
+	defer listener.Close()
+	s.logger.Infof("listener started successfully on %s", listener.Addr().String())
+
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				conn, err := listener.Accept()
+				if err != nil {
+					continue
+				}
+				select {
+				case s.localChannel <- LocalTCPConn{conn: conn, remoteAddr: remoteAddr, timeCreated: time.Now().UnixMilli()}:
+					if s.isMux() {
+						atomic.AddInt32(&s.streamCounter, 1)
+						if atomic.LoadInt32(&s.streamCounter) >= atomic.LoadInt32(&s.sessionCounter)*int32(s.config.MuxCon) {
+							select {
+							case s.reqNewConnChan <- struct{}{}:
+							default:
+							}
+						}
+					} else {
+						select {
+						case s.reqNewConnChan <- struct{}{}:
+						default:
+						}
+					}
+				default:
+					conn.Close()
+				}
+			}
+		}
+	}()
+
+	<-s.ctx.Done()
+}
+
+func (s *XhttpServerTransport) handleRawLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case localConn := <-s.localChannel:
+		loop:
+			for {
+				if time.Now().UnixMilli()-localConn.timeCreated > 3000 {
+					localConn.conn.Close()
+					break loop
+				}
+				select {
+				case <-s.ctx.Done():
+					return
+				case tunnelConn := <-s.rawChannel:
+					if err := utils.SendBinaryString(tunnelConn, localConn.remoteAddr); err != nil {
+						tunnelConn.Close()
+						continue loop
+					}
+					go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, tunnelConn, s.logger, s.usageMonitor, handlers.LocalPortOf(localConn.conn), s.config.Sniffer)
+					break loop
+				}
+			}
+		}
+	}
+}
+
+func (s *XhttpServerTransport) handleMuxLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case session := <-s.muxChannel:
+			atomic.AddInt32(&s.sessionCounter, 1)
+			go s.handleMuxSession(session)
+		}
+	}
+}
+
+func (s *XhttpServerTransport) handleMuxSession(session *smux.Session) {
+	counter := make(chan struct{}, s.config.MuxCon)
+	defer session.Close()
+
+	for {
+		counter <- struct{}{}
+		select {
+		case <-s.ctx.Done():
+			<-counter
+			return
+		case incomingConn := <-s.localChannel:
+			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 {
+				incomingConn.conn.Close()
+				atomic.AddInt32(&s.streamCounter, -1)
+				<-counter
+				continue
+			}
+			stream, err := session.OpenStream()
+			if err != nil {
+				atomic.AddInt32(&s.sessionCounter, -1)
+				<-counter
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+				}
+				select {
+				case s.reqNewConnChan <- struct{}{}:
+				default:
+				}
+				return
+			}
+			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+				stream.Close()
+				<-counter
+				select {
+				case s.localChannel <- incomingConn:
+				default:
+					incomingConn.conn.Close()
+				}
+				continue
+			}
+			go func() {
+				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, handlers.LocalPortOf(incomingConn.conn), s.config.Sniffer)
+				atomic.AddInt32(&s.streamCounter, -1)
+				<-counter
+			}()
+		}
+	}
+}

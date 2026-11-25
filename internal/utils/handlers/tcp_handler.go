@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 
 	"github.com/musix/backhaul/internal/web"
@@ -16,6 +17,26 @@ var copyBufPool = sync.Pool{
 		b := make([]byte, 32*1024)
 		return &b
 	},
+}
+
+// LocalPortOf safely extracts the local port of any net.Conn without panicking.
+func LocalPortOf(c net.Conn) int {
+	if c == nil || c.LocalAddr() == nil {
+		return 0
+	}
+	switch a := c.LocalAddr().(type) {
+	case *net.TCPAddr:
+		return a.Port
+	case *net.UDPAddr:
+		return a.Port
+	default:
+		_, portStr, err := net.SplitHostPort(a.String())
+		if err != nil {
+			return 0
+		}
+		p, _ := strconv.Atoi(portStr)
+		return p
+	}
 }
 
 func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {

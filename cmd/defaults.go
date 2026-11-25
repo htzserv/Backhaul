@@ -136,6 +136,7 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Client.UTLSFingerprint = defaultUTLS
 	}
 
+	// KCP Server defaults
 	if cfg.Server.KCPMode == "" {
 		cfg.Server.KCPMode = defaultKCPMode
 	}
@@ -166,6 +167,7 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Server.KCPRcvWnd = defaultKCPRcvWnd
 	}
 
+	// KCP Client defaults
 	if cfg.Client.KCPMode == "" {
 		cfg.Client.KCPMode = defaultKCPMode
 	}
@@ -196,6 +198,7 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Client.KCPRcvWnd = defaultKCPRcvWnd
 	}
 
+	// XHTTP defaults
 	if cfg.Server.XHTTPPath == "" {
 		cfg.Server.XHTTPPath = defaultXHTTPPath
 	} else if !strings.HasPrefix(cfg.Server.XHTTPPath, "/") {
