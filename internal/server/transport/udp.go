@@ -65,7 +65,7 @@ func NewUDPServer(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 	return server
 }
 func (s *UdpTransport) Start() {
-	s.config.TunnelStatus = "Disconnected (UDP)"
+	s.usageMonitor.SetStatus("Disconnected (UDP)")
 
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
@@ -85,8 +85,6 @@ func (s *UdpTransport) Restart() {
 
 	// for removing timeout logs
 	level := s.logger.Level
-	s.logger.SetLevel(logrus.FatalLevel)
-
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -106,21 +104,20 @@ func (s *UdpTransport) Restart() {
 	s.tunnelChannel = make(chan *TunnelUDPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
+	s.usageMonitor.SetStatus("")
 	s.controlChannel = nil
 	s.activeConnections = map[string]*TunnelUDPConn{}
 	s.activeMu = sync.Mutex{}
 
 	// set the log level again
-	s.logger.SetLevel(level)
-
 	go s.Start()
 }
 
 func (s *UdpTransport) channelHandshake() {
 	listener, err := net.Listen("tcp", s.config.BindAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		s.logger.Errorf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		return
 		return
 	}
 
@@ -275,12 +272,14 @@ func (s *UdpTransport) channelHandler() {
 func (s *UdpTransport) tunnelListener() {
 	tunnelUDPAddr, err := net.ResolveUDPAddr("udp", s.config.BindAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to resolve tunnel address: %v", err)
+		s.logger.Errorf("failed to resolve tunnel address: %v", err)
+		return
 	}
 
 	listener, err := net.ListenUDP("udp", tunnelUDPAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to listen on tunnel UDP port: %v", err)
+		s.logger.Errorf("failed to listen on tunnel UDP port: %v", err)
+		return
 	}
 
 	defer listener.Close()
@@ -380,18 +379,21 @@ func (s *UdpTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -405,7 +407,8 @@ func (s *UdpTransport) parsePortMappings() {
 				// Handle single port case
 				port, err := strconv.Atoi(localPortOrRange)
 				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port format: %s", localPortOrRange)
+				continue
 				}
 				localAddr = fmt.Sprintf(":%d", port)
 			}
@@ -418,18 +421,21 @@ func (s *UdpTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -449,7 +455,8 @@ func (s *UdpTransport) parsePortMappings() {
 				}
 			}
 		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+			s.logger.Errorf("invalid port mapping format: %s", portMapping)
+				continue
 		}
 		// Start listeners for single port
 		go s.localListener(localAddr, remoteAddr)
@@ -459,12 +466,14 @@ func (s *UdpTransport) parsePortMappings() {
 func (s *UdpTransport) localListener(localAddr, remoteAddr string) {
 	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to resolve local address: %v", err)
+		s.logger.Errorf("failed to resolve local address: %v", err)
+		return
 	}
 
 	listener, err := net.ListenUDP("udp", localUDPAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to listen on local UDP port: %v", err)
+		s.logger.Errorf("failed to listen on local UDP port: %v", err)
+		return
 	}
 
 	defer listener.Close()
@@ -731,3 +740,5 @@ func (s *UdpTransport) keepAlive(conn *TunnelUDPConn) {
 		}
 	}
 }
+
+func (s *UdpTransport) Status() string { return s.usageMonitor.GetStatus() }

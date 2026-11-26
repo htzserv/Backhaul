@@ -55,6 +55,7 @@ func (c *Client) Start() {
 			RemoteHost: rh,
 			BasePort:   gBase,
 			Copies:     c.config.GameCopies,
+			Ports:      c.config.GamePorts,
 		}, c.logger)
 	}
 
@@ -230,8 +231,10 @@ func (c *Client) Start() {
 				NC:          c.config.KCPNC,
 				AckNoDelay:  c.config.KCPAcksNoDelay,
 				DSCP:        c.config.KCPDSCP,
-				SO_RCVBUF:   c.config.SO_RCVBUF,
-				SO_SNDBUF:   c.config.SO_SNDBUF,
+				SO_RCVBUF:       c.config.SO_RCVBUF,
+				SO_SNDBUF:       c.config.SO_SNDBUF,
+				PortHopRange:    c.config.PortHopRange,
+				PortHopInterval: c.config.PortHopInterval,
 			},
 		}
 		kcpClient := transport.NewKCPClient(c.ctx, kcpCfg, c.logger)
@@ -317,7 +320,8 @@ func (c *Client) Start() {
 		go c.startFailover()
 
 	default:
-		c.logger.Fatal("invalid transport type: ", c.config.Transport)
+		c.logger.Errorf("invalid transport type: %s", c.config.Transport)
+		return
 	}
 
 	<-c.ctx.Done()

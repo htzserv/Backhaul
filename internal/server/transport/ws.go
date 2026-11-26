@@ -30,6 +30,7 @@ type WsTransport struct {
 	tunnelChannel  chan TunnelChannel
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
+	ctrlMu         sync.Mutex
 	controlChannel *websocket.Conn
 	restartMutex   sync.Mutex
 	usageMonitor   *web.Usage
@@ -73,7 +74,7 @@ func (s *WsTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.config.Mode)
+	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.config.Mode))
 	go s.tunnelListener()
 }
 
@@ -84,10 +85,7 @@ func (s *WsTransport) Restart() {
 	defer s.restartMutex.Unlock()
 
 	s.logger.Infof("restarting %s server...", s.config.Mode)
-	if s.controlChannel != nil {
-		_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
-		_ = s.controlChannel.Close()
-	}
+	s.closeControl(true)
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -99,14 +97,18 @@ func (s *WsTransport) Restart() {
 	s.tunnelChannel = make(chan TunnelChannel, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.controlChannel = nil
+	s.setControl(nil)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
+	s.usageMonitor.SetStatus("")
 
 	go s.Start()
 }
 
 func (s *WsTransport) channelHandler() {
+	cc := s.getControl()
+	if cc == nil {
+		return
+	}
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
@@ -121,8 +123,8 @@ func (s *WsTransport) channelHandler() {
 				if readTimeout < 30*time.Second {
 					readTimeout = 30 * time.Second
 				}
-				_ = s.controlChannel.SetReadDeadline(time.Now().Add(readTimeout))
-				_, msg, err := s.controlChannel.ReadMessage()
+				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
+				_, msg, err := cc.ReadMessage()
 				if err != nil {
 					if s.ctx.Err() == nil {
 						s.logger.Warnf("ws control channel closed: %v", err)
@@ -141,15 +143,15 @@ func (s *WsTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = s.writeControl(websocket.BinaryMessage, []byte{utils.SG_Closed})
 			return
 		case <-s.reqNewConnChan:
-			if err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan}); err != nil {
+			if err := s.writeControl(websocket.BinaryMessage, []byte{utils.SG_Chan}); err != nil {
 				go s.Restart()
 				return
 			}
 		case <-ticker.C:
-			if err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
+			if err := s.writeControl(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
 				go s.Restart()
 				return
 			}
@@ -194,14 +196,14 @@ func (s *WsTransport) tunnelListener() {
 			}
 
 			if r.URL.Path == "/channel" {
-				if s.controlChannel != nil {
+				if s.getControl() != nil {
 					s.logger.Warn("new ws control channel requested, restarting...")
-					s.controlChannel.Close()
+					s.closeControl(false)
 					conn.Close()
 					go s.Restart()
 					return
 				}
-				s.controlChannel = conn
+				s.setControl(conn)
 				s.logger.Infof("%s control channel established successfully", s.config.Mode)
 
 				numCPU := runtime.NumCPU()
@@ -213,7 +215,7 @@ func (s *WsTransport) tunnelListener() {
 				for i := 0; i < numCPU; i++ {
 					go s.handleLoop()
 				}
-				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+				s.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", s.config.Mode))
 			} else if strings.HasPrefix(r.URL.Path, "/tunnel") {
 				wsConn := TunnelChannel{
 					conn: conn,
@@ -255,9 +257,7 @@ func (s *WsTransport) tunnelListener() {
 	}
 
 	<-s.ctx.Done()
-	if s.controlChannel != nil {
-		s.controlChannel.Close()
-	}
+	s.closeControl(false)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
@@ -439,3 +439,42 @@ func (s *WsTransport) keepAlive(conn *TunnelChannel) {
 		}
 	}
 }
+
+
+func (s *WsTransport) getControl() *websocket.Conn {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	return s.controlChannel
+}
+
+func (s *WsTransport) setControl(conn *websocket.Conn) {
+	s.ctrlMu.Lock()
+	s.controlChannel = conn
+	s.ctrlMu.Unlock()
+}
+
+func (s *WsTransport) writeControl(msgType int, data []byte) error {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	if s.controlChannel == nil {
+		return websocket.ErrCloseSent
+	}
+	_ = s.controlChannel.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return s.controlChannel.WriteMessage(msgType, data)
+}
+
+func (s *WsTransport) closeControl(sendFarewell bool) {
+	s.ctrlMu.Lock()
+	cc := s.controlChannel
+	if cc != nil {
+		if sendFarewell {
+			_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+			_ = cc.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+		}
+		_ = cc.Close()
+		s.controlChannel = nil
+	}
+	s.ctrlMu.Unlock()
+}
+
+func (s *WsTransport) Status() string { return s.usageMonitor.GetStatus() }

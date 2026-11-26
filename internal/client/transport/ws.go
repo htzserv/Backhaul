@@ -25,6 +25,7 @@ type WsTransport struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	logger          *logrus.Logger
+	ctrlMu          sync.Mutex
 	controlChannel  *websocket.Conn
 	restartMutex    sync.Mutex
 	usageMonitor    *web.Usage
@@ -70,7 +71,7 @@ func (c *WsTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
-	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.config.Mode)
+	c.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", c.config.Mode))
 	go c.channelDialer()
 }
 
@@ -81,10 +82,7 @@ func (c *WsTransport) Restart() {
 	defer c.restartMutex.Unlock()
 
 	c.logger.Infof("restarting %s client...", c.config.Mode)
-	if c.controlChannel != nil {
-		_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
-		_ = c.controlChannel.Close()
-	}
+	c.closeControl(true)
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -93,9 +91,9 @@ func (c *WsTransport) Restart() {
 	ctx, cancel := context.WithCancel(c.parentctx)
 	c.ctx = ctx
 	c.cancel = cancel
-	c.controlChannel = nil
+	c.setControl(nil)
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
-	c.config.TunnelStatus = ""
+	c.usageMonitor.SetStatus("")
 	atomic.StoreInt32(&c.poolConnections, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)
@@ -116,9 +114,9 @@ func (c *WsTransport) channelDialer() {
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
-			c.controlChannel = tunnelWSConn
+			c.setControl(tunnelWSConn)
 			c.logger.Infof("%s control channel established successfully", c.config.Mode)
-			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
+			c.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", c.config.Mode))
 
 			go c.poolMaintainer()
 			go c.channelHandler()
@@ -169,6 +167,10 @@ func (c *WsTransport) poolMaintainer() {
 }
 
 func (c *WsTransport) channelHandler() {
+	cc := c.getControl()
+	if cc == nil {
+		return
+	}
 	msgChan := make(chan byte, 1000)
 	go func() {
 		for {
@@ -180,8 +182,8 @@ func (c *WsTransport) channelHandler() {
 				if readTimeout < 120*time.Second {
 					readTimeout = 120 * time.Second
 				}
-				_ = c.controlChannel.SetReadDeadline(time.Now().Add(readTimeout))
-				_, msg, err := c.controlChannel.ReadMessage()
+				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
+				_, msg, err := cc.ReadMessage()
 				if err != nil {
 					if c.ctx.Err() == nil {
 						c.logger.Warnf("ws control channel closed: %v", err)
@@ -200,7 +202,7 @@ func (c *WsTransport) channelHandler() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = c.writeControl(websocket.BinaryMessage, []byte{utils.SG_Closed})
 			return
 		case msg := <-msgChan:
 			switch msg {
@@ -212,7 +214,7 @@ func (c *WsTransport) channelHandler() {
 					go c.tunnelDialer()
 				}
 			case utils.SG_HB:
-				if err := c.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
+				if err := c.writeControl(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
 					go c.Restart()
 					return
 				}
@@ -278,4 +280,41 @@ func (c *WsTransport) localDialer(tunnelCon *websocket.Conn, remoteAddr string, 
 		return
 	}
 	handlers.WSConnectionHandler(c.ctx, tunnelCon, localConnection, c.logger, c.usageMonitor, port, c.config.Sniffer)
+}
+
+
+func (c *WsTransport) getControl() *websocket.Conn {
+	c.ctrlMu.Lock()
+	defer c.ctrlMu.Unlock()
+	return c.controlChannel
+}
+
+func (c *WsTransport) setControl(conn *websocket.Conn) {
+	c.ctrlMu.Lock()
+	c.controlChannel = conn
+	c.ctrlMu.Unlock()
+}
+
+func (c *WsTransport) writeControl(msgType int, data []byte) error {
+	c.ctrlMu.Lock()
+	defer c.ctrlMu.Unlock()
+	if c.controlChannel == nil {
+		return websocket.ErrCloseSent
+	}
+	_ = c.controlChannel.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return c.controlChannel.WriteMessage(msgType, data)
+}
+
+func (c *WsTransport) closeControl(sendFarewell bool) {
+	c.ctrlMu.Lock()
+	cc := c.controlChannel
+	if cc != nil {
+		if sendFarewell {
+			_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+			_ = cc.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+		}
+		_ = cc.Close()
+		c.controlChannel = nil
+	}
+	c.ctrlMu.Unlock()
 }

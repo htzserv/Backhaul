@@ -15,6 +15,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -251,4 +252,30 @@ func DialUTLSFragmented(ctx context.Context, rawConn net.Conn, sni, fingerprint 
 		return DialUTLS(ctx, rawConn, sni, fingerprint, nextProtos)
 	}
 	return DialUTLS(ctx, &tlsRecordFragmentConn{Conn: rawConn}, sni, fingerprint, nextProtos)
+}
+
+
+var edgePickCounter atomic.Uint64
+
+// PickEdgeIP selects the next clean edge IP from a single or comma-separated list in round-robin order.
+func PickEdgeIP(edgeSpec string) string {
+	edgeSpec = strings.TrimSpace(edgeSpec)
+	if edgeSpec == "" {
+		return ""
+	}
+	if !strings.Contains(edgeSpec, ",") {
+		return edgeSpec
+	}
+	rawParts := strings.Split(edgeSpec, ",")
+	edges := make([]string, 0, len(rawParts))
+	for _, p := range rawParts {
+		if s := strings.TrimSpace(p); s != "" {
+			edges = append(edges, s)
+		}
+	}
+	if len(edges) == 0 {
+		return ""
+	}
+	idx := edgePickCounter.Add(1) - 1
+	return edges[idx%uint64(len(edges))]
 }

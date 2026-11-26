@@ -61,7 +61,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, sni s
 		if err != nil {
 			return nil, fmt.Errorf("invalid address format, failed to parse: %w", err)
 		}
-		dialTarget = net.JoinHostPort(edgeIP, port)
+		dialTarget = net.JoinHostPort(PickEdgeIP(edgeIP), port)
 	}
 
 	if sni == "" {

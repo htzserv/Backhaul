@@ -54,23 +54,26 @@ type ServerConfig struct {
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 	ProxyProtocol    bool          `toml:"proxy_protocol"`
 	FallbackAddr     string        `toml:"fallback_addr"`
+	RateLimitMbps    float64       `toml:"rate_limit_mbps"`
 
 	// KCP options
-	KCPMode        string `toml:"kcp_mode"`
-	KCPKey         string `toml:"kcp_key"`
-	KCPCrypt       string `toml:"kcp_crypt"`
-	KCPNoFEC       bool   `toml:"kcp_nofec"`
-	KCPDataShard   int    `toml:"kcp_datashard"`
-	KCPParityShard int    `toml:"kcp_parityshard"`
-	KCPMTU         int    `toml:"kcp_mtu"`
-	KCPSndWnd      int    `toml:"kcp_sndwnd"`
-	KCPRcvWnd      int    `toml:"kcp_rcvwnd"`
-	KCPNoDelay     int    `toml:"kcp_nodelay"`
-	KCPInterval    int    `toml:"kcp_interval"`
-	KCPResend      int    `toml:"kcp_resend"`
-	KCPNC          int    `toml:"kcp_nc"`
-	KCPAcksNoDelay bool   `toml:"kcp_acknodelay"`
-	KCPDSCP        int    `toml:"kcp_dscp"`
+	KCPMode         string `toml:"kcp_mode"`
+	KCPKey          string `toml:"kcp_key"`
+	KCPCrypt        string `toml:"kcp_crypt"`
+	KCPNoFEC        bool   `toml:"kcp_nofec"`
+	KCPDataShard    int    `toml:"kcp_datashard"`
+	KCPParityShard  int    `toml:"kcp_parityshard"`
+	KCPMTU          int    `toml:"kcp_mtu"`
+	KCPSndWnd       int    `toml:"kcp_sndwnd"`
+	KCPRcvWnd       int    `toml:"kcp_rcvwnd"`
+	KCPNoDelay      int    `toml:"kcp_nodelay"`
+	KCPInterval     int    `toml:"kcp_interval"`
+	KCPResend       int    `toml:"kcp_resend"`
+	KCPNC           int    `toml:"kcp_nc"`
+	KCPAcksNoDelay  bool   `toml:"kcp_acknodelay"`
+	KCPDSCP         int    `toml:"kcp_dscp"`
+	PortHopRange    string `toml:"port_hop_range"`
+	PortHopInterval int    `toml:"port_hop_interval"`
 
 	// XHTTP & Anti-DPI options
 	XHTTPPath   string `toml:"xhttp_path"`
@@ -78,19 +81,19 @@ type ServerConfig struct {
 	XHTTPMode   string `toml:"xhttp_mode"`
 	TLSFragment bool   `toml:"tls_fragment"`
 
-	// Phase 3: Parallax (Multi-Lane TCP + KCP/FEC)
+	// Parallax (Multi-Lane TCP + KCP/FEC + AEAD)
 	ParallaxLanes     int `toml:"parallax_lanes"`
 	ParallaxWarmupMin int `toml:"parallax_warmup_min"`
 	ParallaxWarmupMax int `toml:"parallax_warmup_max"`
 	ParallaxStallSec  int `toml:"parallax_stall_sec"`
 
-	// Phase 3: Multi-Transport Failover
+	// Multi-Transport Failover
 	FailoverTransports []string `toml:"failover_transports"`
 	FailoverBasePort   int      `toml:"failover_base_port"`
 	FailoverProbeSec   int      `toml:"failover_probe_sec"`
 	FailoverRestoreSec int      `toml:"failover_restore_sec"`
 
-	// Phase 3: Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
+	// Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
 	GameMode     bool     `toml:"game_mode"`
 	GameCopies   int      `toml:"game_copies"`
 	GameBasePort int      `toml:"game_base_port"`
@@ -118,29 +121,33 @@ type ClientConfig struct {
 	DialTimeout      int           `toml:"dial_timeout"`
 	AggressivePool   bool          `toml:"aggressive_pool"`
 	EdgeIP           string        `toml:"edge_ip"`
+	EdgeIPs          []string      `toml:"edge_ips"`
 	SNI              string        `toml:"sni"`
 	UTLSFingerprint  string        `toml:"utls_fingerprint"`
 	SkipOptz         bool          `toml:"skip_optz"`
 	MSS              int           `toml:"mss"`
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
+	RateLimitMbps    float64       `toml:"rate_limit_mbps"`
 
 	// KCP options
-	KCPMode        string `toml:"kcp_mode"`
-	KCPKey         string `toml:"kcp_key"`
-	KCPCrypt       string `toml:"kcp_crypt"`
-	KCPNoFEC       bool   `toml:"kcp_nofec"`
-	KCPDataShard   int    `toml:"kcp_datashard"`
-	KCPParityShard int    `toml:"kcp_parityshard"`
-	KCPMTU         int    `toml:"kcp_mtu"`
-	KCPSndWnd      int    `toml:"kcp_sndwnd"`
-	KCPRcvWnd      int    `toml:"kcp_rcvwnd"`
-	KCPNoDelay     int    `toml:"kcp_nodelay"`
-	KCPInterval    int    `toml:"kcp_interval"`
-	KCPResend      int    `toml:"kcp_resend"`
-	KCPNC          int    `toml:"kcp_nc"`
-	KCPAcksNoDelay bool   `toml:"kcp_acknodelay"`
-	KCPDSCP        int    `toml:"kcp_dscp"`
+	KCPMode         string `toml:"kcp_mode"`
+	KCPKey          string `toml:"kcp_key"`
+	KCPCrypt        string `toml:"kcp_crypt"`
+	KCPNoFEC        bool   `toml:"kcp_nofec"`
+	KCPDataShard    int    `toml:"kcp_datashard"`
+	KCPParityShard  int    `toml:"kcp_parityshard"`
+	KCPMTU          int    `toml:"kcp_mtu"`
+	KCPSndWnd       int    `toml:"kcp_sndwnd"`
+	KCPRcvWnd       int    `toml:"kcp_rcvwnd"`
+	KCPNoDelay      int    `toml:"kcp_nodelay"`
+	KCPInterval     int    `toml:"kcp_interval"`
+	KCPResend       int    `toml:"kcp_resend"`
+	KCPNC           int    `toml:"kcp_nc"`
+	KCPAcksNoDelay  bool   `toml:"kcp_acknodelay"`
+	KCPDSCP         int    `toml:"kcp_dscp"`
+	PortHopRange    string `toml:"port_hop_range"`
+	PortHopInterval int    `toml:"port_hop_interval"`
 
 	// XHTTP & Anti-DPI options
 	XHTTPPath   string `toml:"xhttp_path"`
@@ -148,19 +155,19 @@ type ClientConfig struct {
 	XHTTPMode   string `toml:"xhttp_mode"`
 	TLSFragment bool   `toml:"tls_fragment"`
 
-	// Phase 3: Parallax (Multi-Lane TCP + KCP/FEC)
+	// Parallax (Multi-Lane TCP + KCP/FEC + AEAD)
 	ParallaxLanes     int `toml:"parallax_lanes"`
 	ParallaxWarmupMin int `toml:"parallax_warmup_min"`
 	ParallaxWarmupMax int `toml:"parallax_warmup_max"`
 	ParallaxStallSec  int `toml:"parallax_stall_sec"`
 
-	// Phase 3: Multi-Transport Failover
+	// Multi-Transport Failover
 	FailoverTransports []string `toml:"failover_transports"`
 	FailoverBasePort   int      `toml:"failover_base_port"`
 	FailoverProbeSec   int      `toml:"failover_probe_sec"`
 	FailoverRestoreSec int      `toml:"failover_restore_sec"`
 
-	// Phase 3: Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
+	// Game Mode (Multi-Copy Low-Latency Encrypted UDP Datagrams)
 	GameMode     bool     `toml:"game_mode"`
 	GameCopies   int      `toml:"game_copies"`
 	GameBasePort int      `toml:"game_base_port"`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
@@ -62,7 +63,7 @@ func NewXHTTPSharedClients(cfg XHTTPDialConfig) (*XHTTPSharedClients, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid remote_addr: %w", err)
 		}
-		dialTarget = net.JoinHostPort(cfg.EdgeIP, port)
+		dialTarget = net.JoinHostPort(PickEdgeIP(cfg.EdgeIP), port)
 	}
 
 	hostHeader := cfg.HostHeader
@@ -197,7 +198,7 @@ func DialXHTTP(parentCtx context.Context, cfg XHTTPDialConfig) (net.Conn, error)
 			cancel()
 			return nil, fmt.Errorf("invalid remote_addr: %w", err)
 		}
-		dialTarget = net.JoinHostPort(cfg.EdgeIP, port)
+		dialTarget = net.JoinHostPort(PickEdgeIP(cfg.EdgeIP), port)
 	}
 
 	hostHeader := cfg.HostHeader
@@ -355,6 +356,7 @@ func (c *XHTTPClientConn) getWriteErr() error {
 }
 
 func (c *XHTTPClientConn) packetUpWorker() {
+	retryDelays := []time.Duration{150 * time.Millisecond, 350 * time.Millisecond, 700 * time.Millisecond}
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -364,28 +366,51 @@ func (c *XHTTPClientConn) packetUpWorker() {
 				return
 			}
 			postURL := fmt.Sprintf("%s/%d", c.baseURL, pkt.seq)
-			req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, postURL, bytes.NewReader(pkt.data))
-			if err != nil {
-				c.setWriteErr(err)
-				c.Close()
-				return
-			}
-			req.Host = c.hostHeader
-			req.Header.Set("Authorization", "Bearer "+c.token)
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-			req.Header.Set("Content-Type", "application/octet-stream")
-			req.Header.Set("X-Session-Mode", "packet-up")
+			var lastErr error
+			sent := false
+			for attempt := 0; attempt <= len(retryDelays); attempt++ {
+				req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, postURL, bytes.NewReader(pkt.data))
+				if err != nil {
+					lastErr = err
+					break
+				}
+				req.Host = c.hostHeader
+				req.Header.Set("Authorization", "Bearer "+c.token)
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+				req.Header.Set("Content-Type", "application/octet-stream")
+				req.Header.Set("X-Session-Mode", "packet-up")
 
-			resp, err := c.client.Do(req)
-			if err != nil {
-				c.setWriteErr(err)
-				c.Close()
-				return
+				resp, err := c.client.Do(req)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+						sent = true
+						break
+					}
+					lastErr = fmt.Errorf("xhttp packet-up status: %d", resp.StatusCode)
+					// Only retry transient CDN/proxy errors (429, 5xx)
+					if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+						break
+					}
+				} else {
+					lastErr = err
+					if c.ctx.Err() != nil {
+						break
+					}
+				}
+				if attempt < len(retryDelays) {
+					timer := time.NewTimer(retryDelays[attempt] + time.Duration(mrand.Intn(80))*time.Millisecond)
+					select {
+					case <-c.ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+				}
 			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-				c.setWriteErr(fmt.Errorf("xhttp packet-up status: %d", resp.StatusCode))
+			if !sent {
+				c.setWriteErr(lastErr)
 				c.Close()
 				return
 			}
@@ -550,6 +575,7 @@ type serverXHTTPSession struct {
 	upReader    *io.PipeReader
 	upWriter    *io.PipeWriter
 	seqMu       sync.Mutex
+	upWriteMu   sync.Mutex
 	nextSeq     uint64
 	pendingSeq  map[uint64][]byte
 	remoteAddr  net.Addr
@@ -675,16 +701,17 @@ func (s *serverXHTTPSession) SetWriteDeadline(t time.Time) error {
 
 func (s *serverXHTTPSession) pushOrderedPacket(seq uint64, data []byte) error {
 	s.seqMu.Lock()
-	defer s.seqMu.Unlock()
-
 	if seq < s.nextSeq {
+		s.seqMu.Unlock()
 		return nil
 	}
 	if len(s.pendingSeq) > 512 {
+		s.seqMu.Unlock()
 		return fmt.Errorf("too many out-of-order xhttp packets")
 	}
 	s.pendingSeq[seq] = data
 
+	var ready [][]byte
 	for {
 		chunk, ok := s.pendingSeq[s.nextSeq]
 		if !ok {
@@ -692,6 +719,16 @@ func (s *serverXHTTPSession) pushOrderedPacket(seq uint64, data []byte) error {
 		}
 		delete(s.pendingSeq, s.nextSeq)
 		s.nextSeq++
+		ready = append(ready, chunk)
+	}
+	s.seqMu.Unlock()
+
+	if len(ready) == 0 {
+		return nil
+	}
+	s.upWriteMu.Lock()
+	defer s.upWriteMu.Unlock()
+	for _, chunk := range ready {
 		if _, err := s.upWriter.Write(chunk); err != nil {
 			return err
 		}
@@ -701,6 +738,7 @@ func (s *serverXHTTPSession) pushOrderedPacket(seq uint64, data []byte) error {
 
 type XHTTPServerHandler struct {
 	token         string
+	expectedHost  string
 	basePath      string
 	bindAddr      string
 	fallbackProxy *httputil.ReverseProxy
@@ -710,7 +748,7 @@ type XHTTPServerHandler struct {
 	sessions map[string]*serverXHTTPSession
 }
 
-func NewXHTTPServerHandler(ctx context.Context, bindAddr, basePath, token, fallbackAddr string, onAccept func(purpose string, conn net.Conn)) http.Handler {
+func NewXHTTPServerHandler(ctx context.Context, bindAddr, basePath, expectedHost, token, fallbackAddr string, onAccept func(purpose string, conn net.Conn)) http.Handler {
 	if basePath == "" {
 		basePath = "/api/v1/stream"
 	}
@@ -732,6 +770,7 @@ func NewXHTTPServerHandler(ctx context.Context, bindAddr, basePath, token, fallb
 
 	h := &XHTTPServerHandler{
 		token:         token,
+		expectedHost:  strings.ToLower(strings.TrimSpace(expectedHost)),
 		basePath:      basePath,
 		bindAddr:      bindAddr,
 		fallbackProxy: fbProxy,
@@ -803,7 +842,22 @@ func (h *XHTTPServerHandler) removeSession(id string) {
 }
 
 func (h *XHTTPServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "Bearer "+h.token || !strings.HasPrefix(r.URL.Path, h.basePath+"/") {
+	expectedAuth := "Bearer " + h.token
+	gotAuth := r.Header.Get("Authorization")
+	authOK := len(gotAuth) == len(expectedAuth) && subtle.ConstantTimeCompare([]byte(gotAuth), []byte(expectedAuth)) == 1
+	hostOK := true
+	if h.expectedHost != "" {
+		reqHost := strings.ToLower(strings.TrimSpace(r.Host))
+		if rh, _, err := net.SplitHostPort(reqHost); err == nil {
+			reqHost = rh
+		}
+		expHost := h.expectedHost
+		if eh, _, err := net.SplitHostPort(expHost); err == nil {
+			expHost = eh
+		}
+		hostOK = (reqHost == expHost)
+	}
+	if !authOK || !hostOK || !strings.HasPrefix(r.URL.Path, h.basePath+"/") {
 		h.serveFallback(w, r)
 		return
 	}

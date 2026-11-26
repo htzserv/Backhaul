@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	parallaxMagic     = "BHP1"
+	parallaxMagic     = "BHP2"
 	parallaxRecData   = 0x01
 	parallaxRecPad    = 0x02
 	parallaxMaxRecLen = 64 * 1024
+	parallaxSkewSec   = 300 // ±5 minutes anti-replay tolerance
 )
 
 type ParallaxParams struct {
@@ -38,27 +39,58 @@ type ParallaxParams struct {
 	KCP         KCPParams
 }
 
-func deriveParallaxStreams(token string, nonce []byte) (c2s, s2c cipher.Stream) {
-	mk := func(dir string) cipher.Stream {
+type parallaxCipherPair struct {
+	c2sAEAD   cipher.AEAD
+	s2cAEAD   cipher.AEAD
+	c2sPrefix [4]byte
+	s2cPrefix [4]byte
+}
+
+func deriveParallaxAEADs(token string, nonce []byte) (*parallaxCipherPair, error) {
+	mk := func(dir string) (cipher.AEAD, [4]byte, error) {
 		h := sha256.New()
-		h.Write([]byte("bh-parallax-" + dir + ":"))
+		h.Write([]byte("bh-parallax-v2-" + dir + ":"))
 		h.Write([]byte(token))
 		h.Write(nonce)
 		key := h.Sum(nil)
 
-		ivh := sha256.New()
-		ivh.Write([]byte("bh-parallax-iv-" + dir + ":"))
-		ivh.Write(nonce)
-		ivh.Write([]byte(token))
-		iv := ivh.Sum(nil)[:aes.BlockSize]
+		ph := sha256.New()
+		ph.Write([]byte("bh-parallax-np-" + dir + ":"))
+		ph.Write(nonce)
+		ph.Write([]byte(token))
+		var pfx [4]byte
+		copy(pfx[:], ph.Sum(nil)[:4])
 
-		blk, _ := aes.NewCipher(key)
-		return cipher.NewCTR(blk, iv)
+		blk, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, pfx, err
+		}
+		aead, err := cipher.NewGCM(blk)
+		return aead, pfx, err
 	}
-	return mk("c2s"), mk("s2c")
+	c2s, c2sP, err := mk("c2s")
+	if err != nil {
+		return nil, err
+	}
+	s2c, s2cP, err := mk("s2c")
+	if err != nil {
+		return nil, err
+	}
+	return &parallaxCipherPair{
+		c2sAEAD:   c2s,
+		s2cAEAD:   s2c,
+		c2sPrefix: c2sP,
+		s2cPrefix: s2cP,
+	}, nil
 }
 
-// sessionAddr maps a 16-byte sessionID to a deterministic *net.UDPAddr key for kcp-go/v5.
+func makeFrameNonce(prefix [4]byte, seq uint64) [12]byte {
+	var n [12]byte
+	copy(n[:4], prefix[:])
+	binary.BigEndian.PutUint64(n[4:12], seq)
+	return n
+}
+
 func sessionAddr(sessID [16]byte) *net.UDPAddr {
 	h := sha256.Sum256(sessID[:])
 	port := int(binary.BigEndian.Uint16(h[3:5]))
@@ -72,17 +104,21 @@ func sessionAddr(sessID [16]byte) *net.UDPAddr {
 }
 
 type parallaxLane struct {
-	conn     net.Conn
-	rs       cipher.Stream
-	ws       cipher.Stream
-	sendCh   chan []byte
-	lastRecv atomic.Int64
-	closed   atomic.Bool
-	closeFn  sync.Once
+	conn      net.Conn
+	rAEAD     cipher.AEAD
+	wAEAD     cipher.AEAD
+	rPrefix   [4]byte
+	wPrefix   [4]byte
+	rSeq      uint64
+	wSeq      uint64
+	sendCh    chan []byte
+	lastRecv  atomic.Int64
+	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
 func (l *parallaxLane) Close() {
-	l.closeFn.Do(func() {
+	l.closeOnce.Do(func() {
 		l.closed.Store(true)
 		_ = l.conn.Close()
 	})
@@ -92,39 +128,46 @@ func (l *parallaxLane) writeRecord(recType byte, payload []byte) error {
 	if l.closed.Load() {
 		return net.ErrClosed
 	}
-	frame := make([]byte, 3+len(payload))
-	frame[0] = recType
-	binary.BigEndian.PutUint16(frame[1:3], uint16(len(payload)))
-	copy(frame[3:], payload)
-	l.ws.XORKeyStream(frame, frame)
+	plain := make([]byte, 1+len(payload))
+	plain[0] = recType
+	copy(plain[1:], payload)
+
+	l.wSeq++
+	nonce := makeFrameNonce(l.wPrefix, l.wSeq)
+	ct := l.wAEAD.Seal(nil, nonce[:], plain, nil)
+
+	frame := make([]byte, 2+len(ct))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(ct)))
+	copy(frame[2:], ct)
+
 	_ = l.conn.SetWriteDeadline(time.Now().Add(6 * time.Second))
 	_, err := l.conn.Write(frame)
 	return err
 }
 
 func (l *parallaxLane) readRecord(stallTimeout time.Duration) (byte, []byte, error) {
-	var hdr [3]byte
+	var lenBuf [2]byte
 	_ = l.conn.SetReadDeadline(time.Now().Add(stallTimeout))
-	if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
+	if _, err := io.ReadFull(l.conn, lenBuf[:]); err != nil {
 		return 0, nil, err
 	}
-	l.rs.XORKeyStream(hdr[:], hdr[:])
-	recType := hdr[0]
-	n := int(binary.BigEndian.Uint16(hdr[1:3]))
-	if n > parallaxMaxRecLen {
-		return 0, nil, fmt.Errorf("parallax frame too large: %d", n)
+	ctLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if ctLen < l.rAEAD.Overhead()+1 || ctLen > parallaxMaxRecLen+l.rAEAD.Overhead()+1 {
+		return 0, nil, fmt.Errorf("parallax invalid frame length: %d", ctLen)
 	}
-	var payload []byte
-	if n > 0 {
-		payload = make([]byte, n)
-		_ = l.conn.SetReadDeadline(time.Now().Add(stallTimeout))
-		if _, err := io.ReadFull(l.conn, payload); err != nil {
-			return 0, nil, err
-		}
-		l.rs.XORKeyStream(payload, payload)
+	ct := make([]byte, ctLen)
+	_ = l.conn.SetReadDeadline(time.Now().Add(stallTimeout))
+	if _, err := io.ReadFull(l.conn, ct); err != nil {
+		return 0, nil, err
+	}
+	l.rSeq++
+	nonce := makeFrameNonce(l.rPrefix, l.rSeq)
+	plain, err := l.rAEAD.Open(nil, nonce[:], ct, nil)
+	if err != nil || len(plain) < 1 {
+		return 0, nil, fmt.Errorf("parallax AEAD auth failed: %w", err)
 	}
 	l.lastRecv.Store(time.Now().UnixNano())
-	return recType, payload, nil
+	return plain[0], plain[1:], nil
 }
 
 func (l *parallaxLane) writerLoop(ctx context.Context) {
@@ -160,8 +203,24 @@ type parallaxInbound struct {
 	addr net.Addr
 }
 
-// ParallaxClientPacketConn multiplexes one KCP+FEC session over N parallel TCP lanes
-// with sticky lane selection, immediate spillover, and transparent auto-redial on silent stalls.
+// parallaxSessionConn wraps *kcp.UDPSession so Close() tears down the underlying
+// ParallaxClientPacketConn and all its TCP lanes & maintainer goroutines with zero leaks.
+type parallaxSessionConn struct {
+	*kcp.UDPSession
+	pc        *ParallaxClientPacketConn
+	closeOnce sync.Once
+}
+
+func (p *parallaxSessionConn) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		err = p.UDPSession.Close()
+		_ = p.pc.Close()
+	})
+	return err
+}
+
+// ParallaxClientPacketConn multiplexes one KCP+FEC session over N parallel AEAD-authenticated TCP lanes.
 type ParallaxClientPacketConn struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -171,18 +230,20 @@ type ParallaxClientPacketConn struct {
 	peerAddr   *net.UDPAddr
 	localAddr  *net.UDPAddr
 
-	mu         sync.RWMutex
-	lanes      []*parallaxLane
-	stickyIdx  int
-	recvCh     chan parallaxInbound
-	closeOnce  sync.Once
-	closed     atomic.Bool
-	readDlMu   sync.Mutex
-	readTimer  *time.Timer
-	readExp    atomic.Bool
+	mu        sync.RWMutex
+	lanes     []*parallaxLane
+	stickyIdx int
+	recvCh    chan parallaxInbound
+	closeOnce sync.Once
+	closed    atomic.Bool
+
+	readDlMu  sync.Mutex
+	readTimer *time.Timer
+	readDlCh  chan struct{}
+	readExp   atomic.Bool
 }
 
-func DialParallaxKCP(parentCtx context.Context, remoteAddr string, params ParallaxParams) (*kcp.UDPSession, error) {
+func DialParallaxKCP(parentCtx context.Context, remoteAddr string, params ParallaxParams) (net.Conn, error) {
 	if params.Lanes < 2 {
 		params.Lanes = 4
 	}
@@ -203,9 +264,9 @@ func DialParallaxKCP(parentCtx context.Context, remoteAddr string, params Parall
 		localAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
 		lanes:      make([]*parallaxLane, params.Lanes),
 		recvCh:     make(chan parallaxInbound, 512),
+		readDlCh:   make(chan struct{}),
 	}
 
-	// Establish initial first lane synchronously so broken endpoints fail fast
 	firstLane, err := pc.dialOneLane(0)
 	if err != nil {
 		cancel()
@@ -214,7 +275,6 @@ func DialParallaxKCP(parentCtx context.Context, remoteAddr string, params Parall
 	pc.lanes[0] = firstLane
 	go pc.runClientLane(0, firstLane)
 
-	// Start remaining lanes & supervisor loops concurrently
 	for i := 1; i < params.Lanes; i++ {
 		go pc.maintainClientLane(i)
 	}
@@ -230,7 +290,7 @@ func DialParallaxKCP(parentCtx context.Context, remoteAddr string, params Parall
 		return nil, err
 	}
 	TuneKCPSession(sess, params.KCP)
-	return sess, nil
+	return &parallaxSessionConn{UDPSession: sess, pc: pc}, nil
 }
 
 func (pc *ParallaxClientPacketConn) dialOneLane(laneIdx int) (*parallaxLane, error) {
@@ -243,7 +303,11 @@ func (pc *ParallaxClientPacketConn) dialOneLane(laneIdx int) (*parallaxLane, err
 	if nonce[0] == 0x16 {
 		nonce[0] ^= 0x5A
 	}
-	c2s, s2c := deriveParallaxStreams(pc.params.Token, nonce)
+	cp, err := deriveParallaxAEADs(pc.params.Token, nonce)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
 
 	wMin, wMax := pc.params.WarmupMin, pc.params.WarmupMax
 	if wMin <= 0 {
@@ -257,25 +321,29 @@ func (pc *ParallaxClientPacketConn) dialOneLane(laneIdx int) (*parallaxLane, err
 		warmupLen = wMin + mrand.Intn(wMax-wMin+1)
 	}
 
-	// Header: magic(4) | sessID(16) | laneID(1) | warmupLen(4) = 25 bytes
-	hdr := make([]byte, 25)
-	copy(hdr[0:4], []byte(parallaxMagic))
-	copy(hdr[4:20], pc.sessID[:])
-	hdr[20] = byte(laneIdx)
-	binary.BigEndian.PutUint32(hdr[21:25], uint32(warmupLen))
-	c2s.XORKeyStream(hdr, hdr)
+	// Authenticated handshake header (33 bytes plain -> 49 bytes with GCM tag):
+	// magic(4) | sessID(16) | laneID(1) | unixSec(8) | warmupLen(4)
+	hdrPlain := make([]byte, 33)
+	copy(hdrPlain[0:4], []byte(parallaxMagic))
+	copy(hdrPlain[4:20], pc.sessID[:])
+	hdrPlain[20] = byte(laneIdx)
+	binary.BigEndian.PutUint64(hdrPlain[21:29], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint32(hdrPlain[29:33], uint32(warmupLen))
+
+	hsNonce := makeFrameNonce(cp.c2sPrefix, 0)
+	hdrSealed := cp.c2sAEAD.Seal(nil, hsNonce[:], hdrPlain, nonce)
 
 	_ = raw.SetWriteDeadline(time.Now().Add(8 * time.Second))
 	if _, err := raw.Write(nonce); err != nil {
 		raw.Close()
 		return nil, err
 	}
-	if _, err := raw.Write(hdr); err != nil {
+	if _, err := raw.Write(hdrSealed); err != nil {
 		raw.Close()
 		return nil, err
 	}
 
-	// Send randomized encrypted warm-up padding to mask lane start pattern
+	// Send randomized high-entropy warm-up padding to mask lane start pattern
 	rem := warmupLen
 	padBuf := make([]byte, 16*1024)
 	for rem > 0 {
@@ -284,7 +352,6 @@ func (pc *ParallaxClientPacketConn) dialOneLane(laneIdx int) (*parallaxLane, err
 			chunk = rem
 		}
 		_, _ = rand.Read(padBuf[:chunk])
-		c2s.XORKeyStream(padBuf[:chunk], padBuf[:chunk])
 		if _, err := raw.Write(padBuf[:chunk]); err != nil {
 			raw.Close()
 			return nil, err
@@ -294,10 +361,12 @@ func (pc *ParallaxClientPacketConn) dialOneLane(laneIdx int) (*parallaxLane, err
 	_ = raw.SetWriteDeadline(time.Time{})
 
 	ln := &parallaxLane{
-		conn:   raw,
-		rs:     s2c,
-		ws:     c2s,
-		sendCh: make(chan []byte, 128),
+		conn:    raw,
+		rAEAD:   cp.s2cAEAD,
+		wAEAD:   cp.c2sAEAD,
+		rPrefix: cp.s2cPrefix,
+		wPrefix: cp.c2sPrefix,
+		sendCh:  make(chan []byte, 128),
 	}
 	ln.lastRecv.Store(time.Now().UnixNano())
 	return ln, nil
@@ -342,10 +411,12 @@ func (pc *ParallaxClientPacketConn) maintainClientLane(idx int) {
 		}
 		ln, err := pc.dialOneLane(idx)
 		if err != nil {
+			timer := time.NewTimer(backoff)
 			select {
 			case <-pc.ctx.Done():
+				timer.Stop()
 				return
-			case <-time.After(backoff):
+			case <-timer.C:
 			}
 			if backoff < 3*time.Second {
 				backoff *= 2
@@ -367,9 +438,15 @@ func (pc *ParallaxClientPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if pc.readExp.Load() {
 		return 0, nil, os.ErrDeadlineExceeded
 	}
+	pc.readDlMu.Lock()
+	dlCh := pc.readDlCh
+	pc.readDlMu.Unlock()
+
 	select {
 	case <-pc.ctx.Done():
 		return 0, nil, net.ErrClosed
+	case <-dlCh:
+		return 0, nil, os.ErrDeadlineExceeded
 	case pkt := <-pc.recvCh:
 		n := copy(p, pkt.data)
 		return n, pkt.addr, nil
@@ -389,7 +466,6 @@ func (pc *ParallaxClientPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if start >= nLanes {
 		start = 0
 	}
-	// Sticky lane selection: stay on current lane while healthy & unblocked, spill on congestion/failure
 	for step := 0; step < nLanes; step++ {
 		idx := (start + step) % nLanes
 		ln := pc.lanes[idx]
@@ -405,13 +481,18 @@ func (pc *ParallaxClientPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		}
 	}
 	pc.mu.Unlock()
-	// Drop packet cleanly on transient total lane congestion; KCP+FEC recovers automatically
 	return len(p), nil
 }
 
 func (pc *ParallaxClientPacketConn) Close() error {
 	pc.closeOnce.Do(func() {
 		pc.closed.Store(true)
+		pc.readDlMu.Lock()
+		if pc.readTimer != nil {
+			pc.readTimer.Stop()
+			pc.readTimer = nil
+		}
+		pc.readDlMu.Unlock()
 		pc.cancel()
 		pc.mu.Lock()
 		for i, ln := range pc.lanes {
@@ -425,10 +506,8 @@ func (pc *ParallaxClientPacketConn) Close() error {
 	return nil
 }
 
-func (pc *ParallaxClientPacketConn) LocalAddr() net.Addr { return pc.localAddr }
-func (pc *ParallaxClientPacketConn) SetDeadline(t time.Time) error {
-	return pc.SetReadDeadline(t)
-}
+func (pc *ParallaxClientPacketConn) LocalAddr() net.Addr              { return pc.localAddr }
+func (pc *ParallaxClientPacketConn) SetDeadline(t time.Time) error     { return pc.SetReadDeadline(t) }
 func (pc *ParallaxClientPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 func (pc *ParallaxClientPacketConn) SetReadDeadline(t time.Time) error {
 	pc.readDlMu.Lock()
@@ -438,16 +517,20 @@ func (pc *ParallaxClientPacketConn) SetReadDeadline(t time.Time) error {
 		pc.readTimer = nil
 	}
 	pc.readExp.Store(false)
+	pc.readDlCh = make(chan struct{})
+	ch := pc.readDlCh
 	if t.IsZero() {
 		return nil
 	}
 	d := time.Until(t)
 	if d <= 0 {
 		pc.readExp.Store(true)
+		close(ch)
 		return nil
 	}
 	pc.readTimer = time.AfterFunc(d, func() {
 		pc.readExp.Store(true)
+		close(ch)
 	})
 	return nil
 }
@@ -469,6 +552,8 @@ type ParallaxServerPacketConn struct {
 	params    ParallaxParams
 	mu        sync.RWMutex
 	sessions  map[string]*parallaxSrvSession
+	nonceMu   sync.Mutex
+	seenNonce map[[32]byte]int64
 	recvCh    chan parallaxInbound
 	closeOnce sync.Once
 	closed    atomic.Bool
@@ -484,15 +569,20 @@ func ListenParallaxKCP(parentCtx context.Context, bindAddr string, params Parall
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
 	spc := &ParallaxServerPacketConn{
-		ctx:      ctx,
-		cancel:   cancel,
-		tcpLn:    tcpLn,
-		params:   params,
-		sessions: make(map[string]*parallaxSrvSession),
-		recvCh:   make(chan parallaxInbound, 1024),
+		ctx:       ctx,
+		cancel:    cancel,
+		tcpLn:     tcpLn,
+		params:    params,
+		sessions:  make(map[string]*parallaxSrvSession),
+		seenNonce: make(map[[32]byte]int64),
+		recvCh:    make(chan parallaxInbound, 1024),
 	}
 	go spc.acceptLoop()
 	go spc.reapSessions()
+	go func() {
+		<-ctx.Done()
+		_ = spc.Close()
+	}()
 
 	block, err := NewKCPBlockCrypt(params.KCP.Crypt, params.KCP.Key)
 	if err != nil {
@@ -520,6 +610,27 @@ func (s *ParallaxServerPacketConn) acceptLoop() {
 	}
 }
 
+func (s *ParallaxServerPacketConn) recordNonce(nonce []byte) bool {
+	var key [32]byte
+	copy(key[:], nonce)
+	now := time.Now().Unix()
+	s.nonceMu.Lock()
+	defer s.nonceMu.Unlock()
+	if _, dup := s.seenNonce[key]; dup {
+		return false
+	}
+	if len(s.seenNonce) > 8192 {
+		cutoff := now - parallaxSkewSec*2
+		for k, ts := range s.seenNonce {
+			if ts < cutoff {
+				delete(s.seenNonce, k)
+			}
+		}
+	}
+	s.seenNonce[key] = now
+	return true
+}
+
 func (s *ParallaxServerPacketConn) handleIncomingLane(raw net.Conn) {
 	_ = raw.SetReadDeadline(time.Now().Add(8 * time.Second))
 	nonce := make([]byte, 32)
@@ -527,27 +638,43 @@ func (s *ParallaxServerPacketConn) handleIncomingLane(raw net.Conn) {
 		raw.Close()
 		return
 	}
-	c2s, s2c := deriveParallaxStreams(s.params.Token, nonce)
+	cp, err := deriveParallaxAEADs(s.params.Token, nonce)
+	if err != nil {
+		raw.Close()
+		return
+	}
 
-	hdr := make([]byte, 25)
-	if _, err := io.ReadFull(raw, hdr); err != nil {
+	hdrSealed := make([]byte, 33+cp.c2sAEAD.Overhead())
+	if _, err := io.ReadFull(raw, hdrSealed); err != nil {
 		raw.Close()
 		return
 	}
-	c2s.XORKeyStream(hdr, hdr)
-	if string(hdr[0:4]) != parallaxMagic {
+	hsNonce := makeFrameNonce(cp.c2sPrefix, 0)
+	hdr, err := cp.c2sAEAD.Open(nil, hsNonce[:], hdrSealed, nonce)
+	if err != nil || len(hdr) != 33 || string(hdr[0:4]) != parallaxMagic {
 		raw.Close()
 		return
 	}
+
+	ts := int64(binary.BigEndian.Uint64(hdr[21:29]))
+	diff := time.Now().Unix() - ts
+	if diff < -parallaxSkewSec || diff > parallaxSkewSec {
+		raw.Close()
+		return
+	}
+	if !s.recordNonce(nonce) {
+		raw.Close()
+		return
+	}
+
 	var sid [16]byte
 	copy(sid[:], hdr[4:20])
-	warmupLen := int(binary.BigEndian.Uint32(hdr[21:25]))
+	warmupLen := int(binary.BigEndian.Uint32(hdr[29:33]))
 	if warmupLen > 512*1024 {
 		raw.Close()
 		return
 	}
 
-	// Drain encrypted warm-up bytes
 	rem := warmupLen
 	discard := make([]byte, 16*1024)
 	for rem > 0 {
@@ -559,16 +686,17 @@ func (s *ParallaxServerPacketConn) handleIncomingLane(raw net.Conn) {
 			raw.Close()
 			return
 		}
-		c2s.XORKeyStream(discard[:chunk], discard[:chunk])
 		rem -= chunk
 	}
 	_ = raw.SetReadDeadline(time.Time{})
 
 	ln := &parallaxLane{
-		conn:   raw,
-		rs:     c2s,
-		ws:     s2c,
-		sendCh: make(chan []byte, 128),
+		conn:    raw,
+		rAEAD:   cp.c2sAEAD,
+		wAEAD:   cp.s2cAEAD,
+		rPrefix: cp.c2sPrefix,
+		wPrefix: cp.s2cPrefix,
+		sendCh:  make(chan []byte, 128),
 	}
 	ln.lastRecv.Store(time.Now().UnixNano())
 
@@ -605,7 +733,6 @@ func (s *ParallaxServerPacketConn) handleIncomingLane(raw net.Conn) {
 		}
 	}
 
-	// Remove closed lane from session
 	sess.mu.Lock()
 	kept := sess.lanes[:0]
 	for _, x := range sess.lanes {
@@ -636,6 +763,15 @@ func (s *ParallaxServerPacketConn) reapSessions() {
 				}
 			}
 			s.mu.Unlock()
+
+			nonceCutoff := time.Now().Unix() - parallaxSkewSec*2
+			s.nonceMu.Lock()
+			for k, ts := range s.seenNonce {
+				if ts < nonceCutoff {
+					delete(s.seenNonce, k)
+				}
+			}
+			s.nonceMu.Unlock()
 		}
 	}
 }

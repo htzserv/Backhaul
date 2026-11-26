@@ -278,4 +278,33 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.GameMode && cfg.Client.KCPMode == defaultKCPMode {
 		cfg.Client.KCPMode = "fast3"
 	}
+
+	// Merge edge_ip (single or comma-separated) with edge_ips list
+	var mergedEdges []string
+	seenEdge := map[string]bool{}
+	addEdge := func(raw string) {
+		for _, p := range strings.Split(raw, ",") {
+			ip := strings.TrimSpace(p)
+			if ip != "" && !seenEdge[ip] {
+				seenEdge[ip] = true
+				mergedEdges = append(mergedEdges, ip)
+			}
+		}
+	}
+	addEdge(cfg.Client.EdgeIP)
+	for _, e := range cfg.Client.EdgeIPs {
+		addEdge(e)
+	}
+	cfg.Client.EdgeIPs = mergedEdges
+	if len(mergedEdges) > 0 {
+		cfg.Client.EdgeIP = strings.Join(mergedEdges, ",")
+	}
+
+	// Port hopping defaults
+	if cfg.Server.PortHopInterval <= 0 {
+		cfg.Server.PortHopInterval = 30
+	}
+	if cfg.Client.PortHopInterval <= 0 {
+		cfg.Client.PortHopInterval = 30
+	}
 }

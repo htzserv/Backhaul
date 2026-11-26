@@ -8,7 +8,10 @@ import (
 	"html/template"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"sync"
 	"time"
 
@@ -30,8 +33,10 @@ type Usage struct {
 	sniffer      bool
 	snifferLog   string
 	mu           sync.Mutex
-	totalTraffic uint64
+	totalTraffic atomic.Uint64
+	statusMu     sync.RWMutex
 	tunnelStatus *string
+	startedAt    time.Time
 }
 
 type PortUsage struct {
@@ -63,8 +68,7 @@ func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog str
 		sniffer:      sniffer,
 		snifferLog:   snifferLog,
 		tunnelStatus: tunnelStatus,
-		mu:           sync.Mutex{},
-		totalTraffic: 0,
+		startedAt:    time.Now(),
 	}
 	return u
 }
@@ -73,6 +77,7 @@ func (m *Usage) Monitor() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", m.handleIndex) // handle index
 	mux.HandleFunc("/stats", m.statsHandler)
+	mux.HandleFunc("/health", m.handleHealth)
 	if m.sniffer {
 		mux.HandleFunc("/data", m.handleData) // New route for JSON data
 	}
@@ -222,7 +227,7 @@ func (m *Usage) saveUsageData() {
 	var mergedUsageData []PortUsage
 	for _, usage := range usageMap {
 		mergedUsageData = append(mergedUsageData, usage)
-		m.totalTraffic += usage.Usage
+		m.totalTraffic.Add(usage).Usage
 	}
 
 	// Step 5: Convert merged data to JSON
@@ -404,7 +409,7 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 	downloadSpeed := float64(finalStats.BytesRecv - initialStats.BytesRecv)
 
 	stats := &SystemStats{
-		TunnelStatus:    *m.tunnelStatus,
+		TunnelStatus:    m.GetStatus(),
 		CPUUsage:        m.formatFloat(cpuPercent[0]),
 		RAMUsage:        m.convertBytesToReadable(memStats.Used),
 		DiskUsage:       m.convertBytesToReadable(diskStats.Used),
@@ -412,7 +417,7 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 		NetworkTraffic:  m.convertBytesToReadable(netStats[0].BytesSent + netStats[0].BytesRecv),
 		DownloadSpeed:   m.formatSpeed(downloadSpeed),
 		UploadSpeed:     m.formatSpeed(uploadSpeed),
-		BackhaulTraffic: m.convertBytesToReadable(m.totalTraffic),
+		BackhaulTraffic: m.convertBytesToReadable(m.totalTraffic.Load()),
 		Sniffer:         map[bool]string{true: "Running", false: "Not running"}[m.sniffer],
 		AllConnections:  fmt.Sprintf("%d", len(connections)),
 	}
@@ -444,4 +449,43 @@ func (m *Usage) getNetworkStats() (*net.IOCountersStat, error) {
 		return nil, fmt.Errorf("no network IO counters found")
 	}
 	return &ioCounters[0], nil
+}
+
+
+func (m *Usage) SetStatus(st string) {
+	if m == nil {
+		return
+	}
+	m.statusMu.Lock()
+	if m.tunnelStatus != nil {
+		*m.tunnelStatus = st
+	}
+	m.statusMu.Unlock()
+}
+
+func (m *Usage) GetStatus() string {
+	if m == nil {
+		return ""
+	}
+	m.statusMu.RLock()
+	defer m.statusMu.RUnlock()
+	if m.tunnelStatus == nil {
+		return ""
+	}
+	return *m.tunnelStatus
+}
+
+func (m *Usage) handleHealth(w http.ResponseWriter, r *http.Request) {
+	st := m.GetStatus()
+	connected := strings.HasPrefix(st, "Connected")
+	resp := map[string]any{
+		"ok":            true,
+		"status":        st,
+		"connected":     connected,
+		"uptime_sec":    int64(time.Since(m.startedAt).Seconds()),
+		"traffic_bytes": m.totalTraffic.Load(),
+		"goroutines":    runtime.NumGoroutine(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }

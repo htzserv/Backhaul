@@ -11,14 +11,16 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/musix/backhaul/internal/web"
 )
 
 type failoverBackend struct {
-	name          string
-	server        *Server
-	portMap       map[string]string // public listen addr -> child loopback addr
-	healthy       atomic.Bool
-	healthySince  int64
+	name         string
+	server       *Server
+	portMap      map[string]string // public listen addr -> child loopback addr
+	healthy      atomic.Bool
+	healthySince int64
 }
 
 func allocLoopbackPort() (int, error) {
@@ -26,28 +28,71 @@ func allocLoopbackPort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
+	port := 0
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+		port = ta.Port
+	}
 	_ = ln.Close()
+	if port <= 0 {
+		return 0, fmt.Errorf("failed to allocate loopback port")
+	}
 	return port, nil
 }
 
-func parsePublicMapping(mapping string) (string, string) {
-	parts := strings.SplitN(mapping, "=", 2)
-	local := strings.TrimSpace(parts[0])
-	remote := local
-	if len(parts) == 2 {
-		remote = strings.TrimSpace(parts[1])
+type publicMapping struct {
+	listenAddr string
+	remoteAddr string
+}
+
+func expandPublicMappings(entries []string) []publicMapping {
+	var out []publicMapping
+	for _, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		parts := strings.SplitN(raw, "=", 2)
+		lhs := strings.TrimSpace(parts[0])
+		rhs := ""
+		if len(parts) == 2 {
+			rhs = strings.TrimSpace(parts[1])
+		}
+		if strings.Contains(lhs, "-") {
+			rp := strings.SplitN(lhs, "-", 2)
+			lo, e1 := strconv.Atoi(strings.TrimSpace(rp[0]))
+			hi, e2 := strconv.Atoi(strings.TrimSpace(rp[1]))
+			if e1 == nil && e2 == nil && lo >= 1 && hi <= 65535 && hi >= lo && hi-lo <= 1024 {
+				for p := lo; p <= hi; p++ {
+					rem := strconv.Itoa(p)
+					if rhs != "" {
+						rem = rhs
+					}
+					out = append(out, publicMapping{listenAddr: fmt.Sprintf(":%d", p), remoteAddr: rem})
+				}
+			}
+			continue
+		}
+		if p, err := strconv.Atoi(lhs); err == nil && p >= 1 && p <= 65535 {
+			rem := strconv.Itoa(p)
+			if rhs != "" {
+				rem = rhs
+			}
+			out = append(out, publicMapping{listenAddr: fmt.Sprintf(":%d", p), remoteAddr: rem})
+		} else {
+			rem := lhs
+			if rhs != "" {
+				rem = rhs
+			}
+			out = append(out, publicMapping{listenAddr: lhs, remoteAddr: rem})
+		}
 	}
-	if p, err := strconv.Atoi(local); err == nil && p >= 1 && p <= 65535 {
-		local = fmt.Sprintf(":%d", p)
-	}
-	return local, remote
+	return out
 }
 
 func (s *Server) startFailover() {
 	bindHost, portStr, err := net.SplitHostPort(s.config.BindAddr)
 	if err != nil {
-		s.logger.Fatalf("failover: invalid bind_addr %q: %v", s.config.BindAddr, err)
+		s.logger.Errorf("failover: invalid bind_addr %q: %v", s.config.BindAddr, err)
 		return
 	}
 	basePort := s.config.FailoverBasePort
@@ -62,6 +107,7 @@ func (s *Server) startFailover() {
 		transports = transports[:4]
 	}
 
+	mappings := expandPublicMappings(s.config.Ports)
 	var backends []*failoverBackend
 	pubAddrs := []string{}
 	pubSeen := map[string]bool{}
@@ -77,22 +123,23 @@ func (s *Server) startFailover() {
 		childCfg.WebPort = 0
 		childCfg.PPROF = false
 		childCfg.GameMode = false
+		// Front listener writes Proxy Protocol v2 directly so real client IP is preserved
+		childCfg.ProxyProtocol = false
 
-		childPorts := make([]string, 0, len(s.config.Ports))
+		childPorts := make([]string, 0, len(mappings))
 		pmap := map[string]string{}
-		for _, raw := range s.config.Ports {
-			pubAddr, remoteTarget := parsePublicMapping(raw)
-			if !pubSeen[pubAddr] {
-				pubSeen[pubAddr] = true
-				pubAddrs = append(pubAddrs, pubAddr)
+		for _, m := range mappings {
+			if !pubSeen[m.listenAddr] {
+				pubSeen[m.listenAddr] = true
+				pubAddrs = append(pubAddrs, m.listenAddr)
 			}
 			lp, lerr := allocLoopbackPort()
 			if lerr != nil {
 				continue
 			}
 			lbAddr := fmt.Sprintf("127.0.0.1:%d", lp)
-			pmap[pubAddr] = lbAddr
-			childPorts = append(childPorts, fmt.Sprintf("%s=%s", lbAddr, remoteTarget))
+			pmap[m.listenAddr] = lbAddr
+			childPorts = append(childPorts, fmt.Sprintf("%s=%s", lbAddr, m.remoteAddr))
 		}
 		childCfg.Ports = childPorts
 
@@ -111,11 +158,17 @@ func (s *Server) startFailover() {
 		return
 	}
 
+	failoverStatus := "Disconnected (FAILOVER)"
+	usageMon := web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), s.ctx, s.config.SnifferLog, s.config.Sniffer, &failoverStatus, s.logger)
+	s.setStatusFn(usageMon.GetStatus)
+	if s.config.WebPort > 0 {
+		go usageMon.Monitor()
+	}
+
 	var activeIdx atomic.Int32
 	activeIdx.Store(0)
 	s.logger.Infof("Multi-Transport Failover started with %d carriers (probe=%ds, restore=%ds)", len(backends), s.config.FailoverProbeSec, s.config.FailoverRestoreSec)
 
-	// Supervisor goroutine: tracks live Connected status & promotes/fails over cleanly
 	go func() {
 		probeEvery := time.Duration(s.config.FailoverProbeSec) * time.Second
 		if probeEvery < 2*time.Second {
@@ -134,8 +187,12 @@ func (s *Server) startFailover() {
 				return
 			case <-ticker.C:
 				now := time.Now().Unix()
+				anyHealthy := false
 				for _, b := range backends {
 					ok := b.server.IsConnected()
+					if ok {
+						anyHealthy = true
+					}
 					prev := b.healthy.Swap(ok)
 					if ok && !prev {
 						b.healthySince = now
@@ -147,30 +204,34 @@ func (s *Server) startFailover() {
 				if cur < 0 || cur >= len(backends) {
 					cur = 0
 				}
-				// Immediate failover if current active transport is down
 				if !backends[cur].healthy.Load() {
 					for i, b := range backends {
 						if b.healthy.Load() {
 							activeIdx.Store(int32(i))
-							s.logger.Warnf("FAILOVER SWITCH: %s -> %s", backends[cur].name, b.name)
+							cur = i
+							s.logger.Warnf("FAILOVER SWITCH -> %s", b.name)
 							break
 						}
 					}
 				} else if cur > 0 {
-					// Hysteresis restore: return to higher-priority carrier once stable for restoreDur
 					for i := 0; i < cur; i++ {
 						if backends[i].healthy.Load() && backends[i].healthySince > 0 && time.Duration(now-backends[i].healthySince)*time.Second >= restoreDur {
 							activeIdx.Store(int32(i))
-							s.logger.Infof("FAILOVER RESTORE: %s -> primary %s (healthy for %ds)", backends[cur].name, backends[i].name, now-backends[i].healthySince)
+							cur = i
+							s.logger.Infof("FAILOVER RESTORE -> primary %s (healthy for %ds)", backends[i].name, now-backends[i].healthySince)
 							break
 						}
 					}
+				}
+				if anyHealthy {
+					usageMon.SetStatus(fmt.Sprintf("Connected (FAILOVER: %s)", backends[cur].name))
+				} else {
+					usageMon.SetStatus("Disconnected (FAILOVER)")
 				}
 			}
 		}
 	}()
 
-	// Public port listeners routing each incoming connection to the currently active healthy carrier
 	for _, pubAddr := range pubAddrs {
 		listenAddr := pubAddr
 		go func() {
@@ -198,9 +259,13 @@ func (s *Server) startFailover() {
 					cur := int(activeIdx.Load())
 					var target net.Conn
 					var dialErr error
-					// Try active backend first, then fall through to any other healthy backend
+
+					// Pass 1: try currently active & other healthy carriers first
 					for step := 0; step < len(backends); step++ {
 						idx := (cur + step) % len(backends)
+						if !backends[idx].healthy.Load() {
+							continue
+						}
 						dst := backends[idx].portMap[listenAddr]
 						if dst == "" {
 							continue
@@ -210,14 +275,42 @@ func (s *Server) startFailover() {
 							break
 						}
 					}
+					// Pass 2: if status check hasn't ticked yet, fall back to active backend
+					if target == nil {
+						if dst := backends[cur].portMap[listenAddr]; dst != "" {
+							target, _ = net.DialTimeout("tcp", dst, 2*time.Second)
+						}
+					}
 					if target == nil {
 						return
 					}
 					defer target.Close()
+
+					if s.config.ProxyProtocol {
+						if err := handlers.WriteProxyProtocol(in, target); err != nil {
+							s.logger.Debugf("failover proxy protocol write failed: %v", err)
+							return
+						}
+					}
+
 					var wg sync.WaitGroup
 					wg.Add(2)
-					go func() { defer wg.Done(); _, _ = io.Copy(target, in); _ = target.Close() }()
-					go func() { defer wg.Done(); _, _ = io.Copy(in, target); _ = in.Close() }()
+					go func() {
+						defer wg.Done()
+						n, _ := io.Copy(target, in)
+						if s.config.Sniffer {
+							usageMon.AddOrUpdatePort(handlers.LocalPortOf(in), uint64(n))
+						}
+						_ = target.Close()
+					}()
+					go func() {
+						defer wg.Done()
+						n, _ := io.Copy(in, target)
+						if s.config.Sniffer {
+							usageMon.AddOrUpdatePort(handlers.LocalPortOf(in), uint64(n))
+						}
+						_ = in.Close()
+					}()
 					wg.Wait()
 				}(cli)
 			}

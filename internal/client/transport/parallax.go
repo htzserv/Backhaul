@@ -100,7 +100,7 @@ func (c *ParallaxClientTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
-	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.modeLabel())
+	c.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", c.modeLabel()))
 	go c.channelDialer()
 }
 
@@ -164,7 +164,7 @@ func (c *ParallaxClientTransport) channelDialer() {
 
 			c.setControl(conn)
 			c.logger.Infof("%s control channel established successfully", c.modeLabel())
-			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.modeLabel())
+			c.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", c.modeLabel()))
 
 			go c.poolMaintainer()
 			go c.channelHandler()

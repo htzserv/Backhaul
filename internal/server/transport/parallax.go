@@ -39,6 +39,7 @@ type ParallaxServerConfig struct {
 	MaxStreamBuffer  int
 	WebPort          int
 	ProxyProtocol    bool
+	AcceptUDP        bool
 	Parallax         network.ParallaxParams
 }
 
@@ -110,13 +111,13 @@ func (s *ParallaxServerTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.modeLabel())
+	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.modeLabel()))
 
 	go s.tunnelListener()
 	s.channelHandshake()
 
 	if s.getControl() != nil {
-		s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.modeLabel())
+		s.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", s.modeLabel()))
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
 			numCPU = 4
@@ -400,6 +401,9 @@ func (s *ParallaxServerTransport) parsePortMappings() {
 			continue
 		}
 		go s.localListener(localAddr, remoteAddr)
+		if s.config.AcceptUDP && !s.config.Mux {
+			go startGenericUDPListener(s.ctx, localAddr, remoteAddr, s.config.ChannelSize, s.rawChannel, s.reqNewConnChan, s.logger, s.usageMonitor, s.config.Sniffer, nil)
+		}
 	}
 }
 
@@ -550,3 +554,5 @@ func (s *ParallaxServerTransport) handleMuxSession(session *smux.Session) {
 		}
 	}
 }
+
+func (s *ParallaxServerTransport) Status() string { return s.usageMonitor.GetStatus() }

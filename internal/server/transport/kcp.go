@@ -37,6 +37,7 @@ type KcpServerConfig struct {
 	ChannelSize      int
 	WebPort          int
 	ProxyProtocol    bool
+	AcceptUDP        bool
 	KCP              network.KCPParams
 }
 
@@ -108,13 +109,13 @@ func (s *KcpServerTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.modeLabel())
+	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.modeLabel()))
 
 	go s.tunnelListener()
 	s.channelHandshake()
 
 	if s.getControl() != nil {
-		s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.modeLabel())
+		s.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", s.modeLabel()))
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
 			numCPU = 4
@@ -190,17 +191,19 @@ func (s *KcpServerTransport) tunnelListener() {
 
 	s.logger.Infof("%s server started successfully, listening on %s (mode=%s, crypt=%s)", s.modeLabel(), listener.Addr().String(), s.config.KCP.Mode, s.config.KCP.Crypt)
 
-	go func() {
+	acceptFrom := func(ln *kcp.Listener) {
 		for {
 			select {
 			case <-s.ctx.Done():
 				return
 			default:
-				sess, err := listener.AcceptKCP()
+				sess, err := ln.AcceptKCP()
 				if err != nil {
+					if s.ctx.Err() != nil {
+						return
+					}
 					continue
 				}
-
 				go func(sConn *kcp.UDPSession) {
 					network.TuneKCPSession(sConn, s.config.KCP)
 					_ = sConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -257,8 +260,33 @@ func (s *KcpServerTransport) tunnelListener() {
 				}(sess)
 			}
 		}
-	}()
+	}
 
+	if lo, hi, ok := network.ParsePortHopRange(s.config.KCP.PortHopRange); ok {
+		bh, _, _ := net.SplitHostPort(s.config.BindAddr)
+		var hopListeners []*kcp.Listener
+		for p := lo; p <= hi; p++ {
+			hpAddr := net.JoinHostPort(bh, strconv.Itoa(p))
+			if hpAddr == s.config.BindAddr {
+				continue
+			}
+			hln, herr := network.ListenKCP(hpAddr, s.config.KCP)
+			if herr == nil {
+				hopListeners = append(hopListeners, hln)
+				go acceptFrom(hln)
+			}
+		}
+		if len(hopListeners) > 0 {
+			s.logger.Infof("%s port-hopping active across %d extra UDP ports (%d-%d)", s.modeLabel(), len(hopListeners), lo, hi)
+			defer func() {
+				for _, hln := range hopListeners {
+					_ = hln.Close()
+				}
+			}()
+		}
+	}
+
+	go acceptFrom(listener)
 	<-s.ctx.Done()
 }
 
@@ -411,6 +439,9 @@ func (s *KcpServerTransport) parsePortMappings() {
 			continue
 		}
 		go s.localListener(localAddr, remoteAddr)
+		if s.config.AcceptUDP && !s.config.Mux {
+			go startGenericUDPListener(s.ctx, localAddr, remoteAddr, s.config.ChannelSize, s.rawChannel, s.reqNewConnChan, s.logger, s.usageMonitor, s.config.Sniffer, nil)
+		}
 	}
 }
 
@@ -561,3 +592,5 @@ func (s *KcpServerTransport) handleMuxSession(session *smux.Session) {
 		}
 	}
 }
+
+func (s *KcpServerTransport) Status() string { return s.usageMonitor.GetStatus() }

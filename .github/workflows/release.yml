@@ -23,14 +23,15 @@ jobs:
           go-version: "1.23"
           cache: false
 
-      - name: Tidy, Vet & Build Static Binaries (amd64 & arm64)
+      - name: Tidy, Vet, Race Test & Build Static Binaries (amd64 & arm64)
         id: build
         run: |
           VER=$(sed -nE 's/.*const version = "([^"]*)".*/\1/p' main.go | head -n1)
-          [ -n "$VER" ] || VER="v1.0.0"
+          [ -n "$VER" ] || VER="v1.1.0"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           go mod tidy
           go vet ./...
+          go test -race -count=1 ./...
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/bh-linux-amd64 .
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/bh-linux-arm64 .

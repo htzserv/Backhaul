@@ -97,14 +97,14 @@ func (s *TcpMuxTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = "Disconnected (TCPMux)"
+	s.usageMonitor.SetStatus("Disconnected (TCPMux)")
 
 	go s.tunnelListener()
 
 	s.channelHandshake()
 
 	if s.controlChannel != nil {
-		s.config.TunnelStatus = "Connected (TCPMux)"
+		s.usageMonitor.SetStatus("Connected (TCPMux)")
 
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
@@ -137,8 +137,6 @@ func (s *TcpMuxTransport) Restart() {
 
 	// for removing timeout logs
 	level := s.logger.Level
-	s.logger.SetLevel(logrus.FatalLevel)
-
 	// Close any open connections in the tunnel channel.
 	if s.controlChannel != nil {
 		s.controlChannel.Close()
@@ -157,13 +155,11 @@ func (s *TcpMuxTransport) Restart() {
 	s.handshakeChannel = make(chan net.Conn)
 	s.controlChannel = nil
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
+	s.usageMonitor.SetStatus("")
 	s.streamCounter = 0
 	s.sessionCounter = 0
 
 	// set the log level again
-	s.logger.SetLevel(level)
-
 	go s.Start()
 }
 
@@ -297,7 +293,8 @@ func (s *TcpMuxTransport) tunnelListener() {
 		!s.config.Nodelay,
 	)
 	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		s.logger.Errorf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		return
 		return
 	}
 
@@ -332,8 +329,8 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 			}
 
 			// Drop all suspicious packets from other address rather than server
-			if s.controlChannel != nil && s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
-				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
+			if s.controlChannel != nil && handlers.RemoteIPOf(s.controlChannel) != handlers.RemoteIPOf(tcpConn) {
+				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", handlers.RemoteIPOf(tcpConn), handlers.RemoteIPOf(s.controlChannel))
 				tcpConn.Close()
 				continue
 			}
@@ -402,18 +399,21 @@ func (s *TcpMuxTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -427,7 +427,8 @@ func (s *TcpMuxTransport) parsePortMappings() {
 				// Handle single port case
 				port, err := strconv.Atoi(localPortOrRange)
 				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port format: %s", localPortOrRange)
+				continue
 				}
 				localAddr = fmt.Sprintf(":%d", port)
 			}
@@ -440,18 +441,21 @@ func (s *TcpMuxTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -471,7 +475,8 @@ func (s *TcpMuxTransport) parsePortMappings() {
 				}
 			}
 		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+			s.logger.Errorf("invalid port mapping format: %s", portMapping)
+				continue
 		}
 		// Start listeners for single port
 		go s.localListener(localAddr, remoteAddr)
@@ -481,7 +486,8 @@ func (s *TcpMuxTransport) parsePortMappings() {
 func (s *TcpMuxTransport) localListener(localAddr string, remoteAddr string) {
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", localAddr, err)
+		s.logger.Errorf("failed to start listener on %s: %v", localAddr, err)
+		return
 		return
 	}
 
@@ -606,7 +612,7 @@ func (s *TcpMuxTransport) handleSession(session *smux.Session) {
 
 			// Handle data exchange between connections
 			go func() {
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, handlers.LocalPortOf(incomingConn.conn), s.config.Sniffer)
 				atomic.AddInt32(&s.streamCounter, -1)
 				<-counter // read signal from the channel
 			}()
@@ -630,3 +636,5 @@ func (s *TcpMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err err
 		s.logger.Warn("request new connection channel is full")
 	}
 }
+
+func (s *TcpMuxTransport) Status() string { return s.usageMonitor.GetStatus() }

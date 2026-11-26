@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,22 +13,57 @@ import (
 )
 
 type KCPParams struct {
-	Mode        string
-	Key         string
-	Crypt       string
-	DataShard   int
-	ParityShard int
-	MTU         int
-	SndWnd      int
-	RcvWnd      int
-	NoDelay     int
-	Interval    int
-	Resend      int
-	NC          int
-	AckNoDelay  bool
-	DSCP        int
-	SO_RCVBUF   int
-	SO_SNDBUF   int
+	Mode            string
+	Key             string
+	Crypt           string
+	DataShard       int
+	ParityShard     int
+	MTU             int
+	SndWnd          int
+	RcvWnd          int
+	NoDelay         int
+	Interval        int
+	Resend          int
+	NC              int
+	AckNoDelay      bool
+	DSCP            int
+	SO_RCVBUF       int
+	SO_SNDBUF       int
+	PortHopRange    string
+	PortHopInterval int
+}
+
+// ParsePortHopRange parses "10000-10020" into (10000, 10020, true).
+func ParsePortHopRange(spec string) (int, int, bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || lo < 1 || hi > 65535 || hi <= lo {
+		return 0, 0, false
+	}
+	if hi-lo > 256 {
+		hi = lo + 256 // cap listening sockets to protect fd limits
+	}
+	return lo, hi, true
+}
+
+// ActiveHopPort computes a deterministic port inside [lo, hi] for the current time window.
+func ActiveHopPort(token string, lo, hi, intervalSec int, now time.Time) int {
+	if intervalSec <= 0 {
+		intervalSec = 30
+	}
+	slot := now.Unix() / int64(intervalSec)
+	h := sha256.Sum256([]byte(fmt.Sprintf("bh-hop:%s:%d", token, slot)))
+	span := uint64(hi - lo + 1)
+	v := uint64(h[0])<<24 | uint64(h[1])<<16 | uint64(h[2])<<8 | uint64(h[3])
+	return lo + int(v%span)
 }
 
 func NewKCPBlockCrypt(cryptType, key string) (kcp.BlockCrypt, error) {
@@ -110,6 +147,14 @@ func DialKCP(ctx context.Context, remoteAddr string, cfg KCPParams, timeout time
 	backoff := 1 * time.Second
 	var lastErr error
 
+	targetAddr := remoteAddr
+	if lo, hi, ok := ParsePortHopRange(cfg.PortHopRange); ok {
+		if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+			hopPort := ActiveHopPort(cfg.Key, lo, hi, cfg.PortHopInterval, time.Now())
+			targetAddr = net.JoinHostPort(host, strconv.Itoa(hopPort))
+		}
+	}
+
 	for i := 0; i < retry; i++ {
 		select {
 		case <-ctx.Done():
@@ -128,7 +173,7 @@ func DialKCP(ctx context.Context, remoteAddr string, cfg KCPParams, timeout time
 		}
 		ch := make(chan dialRes, 1)
 		go func() {
-			s, e := kcp.DialWithOptions(remoteAddr, block, cfg.DataShard, cfg.ParityShard)
+			s, e := kcp.DialWithOptions(targetAddr, block, cfg.DataShard, cfg.ParityShard)
 			ch <- dialRes{s, e}
 		}()
 
@@ -143,6 +188,13 @@ func DialKCP(ctx context.Context, remoteAddr string, cfg KCPParams, timeout time
 			if cancel != nil {
 				cancel()
 			}
+			// Prevent socket leak if DialWithOptions succeeds after timeout
+			go func() {
+				res := <-ch
+				if res.err == nil && res.sess != nil {
+					_ = res.sess.Close()
+				}
+			}()
 			lastErr = dialCtx.Err()
 		case res := <-ch:
 			if cancel != nil {
@@ -156,7 +208,13 @@ func DialKCP(ctx context.Context, remoteAddr string, cfg KCPParams, timeout time
 		}
 
 		if i < retry-1 {
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 			backoff *= 2
 		}
 	}

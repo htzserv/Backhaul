@@ -33,6 +33,7 @@ type WsMuxTransport struct {
 	tunnelChannel  chan *smux.Session
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
+	ctrlMu         sync.Mutex
 	controlChannel *websocket.Conn
 	usageMonitor   *web.Usage
 	restartMutex   sync.Mutex
@@ -91,7 +92,7 @@ func (s *WsMuxTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.config.Mode)
+	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.config.Mode))
 	go s.tunnelListener()
 }
 
@@ -102,10 +103,7 @@ func (s *WsMuxTransport) Restart() {
 	defer s.restartMutex.Unlock()
 
 	s.logger.Infof("restarting %s server...", s.config.Mode)
-	if s.controlChannel != nil {
-		_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
-		_ = s.controlChannel.Close()
-	}
+	s.closeControl(true)
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -117,9 +115,9 @@ func (s *WsMuxTransport) Restart() {
 	s.tunnelChannel = make(chan *smux.Session, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.controlChannel = nil
+	s.setControl(nil)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
+	s.usageMonitor.SetStatus("")
 	atomic.StoreInt32(&s.streamCounter, 0)
 	atomic.StoreInt32(&s.sessionCounter, 0)
 
@@ -127,6 +125,10 @@ func (s *WsMuxTransport) Restart() {
 }
 
 func (s *WsMuxTransport) channelHandler() {
+	cc := s.getControl()
+	if cc == nil {
+		return
+	}
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
@@ -141,8 +143,8 @@ func (s *WsMuxTransport) channelHandler() {
 				if readTimeout < 30*time.Second {
 					readTimeout = 30 * time.Second
 				}
-				_ = s.controlChannel.SetReadDeadline(time.Now().Add(readTimeout))
-				_, msg, err := s.controlChannel.ReadMessage()
+				_ = cc.SetReadDeadline(time.Now().Add(readTimeout))
+				_, msg, err := cc.ReadMessage()
 				if err != nil {
 					if s.ctx.Err() == nil {
 						s.logger.Warnf("wsmux control channel closed: %v", err)
@@ -161,15 +163,15 @@ func (s *WsMuxTransport) channelHandler() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			_ = s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+			_ = s.writeControl(websocket.BinaryMessage, []byte{utils.SG_Closed})
 			return
 		case <-s.reqNewConnChan:
-			if err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Chan}); err != nil {
+			if err := s.writeControl(websocket.BinaryMessage, []byte{utils.SG_Chan}); err != nil {
 				go s.Restart()
 				return
 			}
 		case <-ticker.C:
-			if err := s.controlChannel.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
+			if err := s.writeControl(websocket.BinaryMessage, []byte{utils.SG_HB}); err != nil {
 				go s.Restart()
 				return
 			}
@@ -214,14 +216,14 @@ func (s *WsMuxTransport) tunnelListener() {
 			}
 
 			if r.URL.Path == "/channel" {
-				if s.controlChannel != nil {
+				if s.getControl() != nil {
 					s.logger.Warn("new wsmux control channel requested, restarting...")
-					s.controlChannel.Close()
+					s.closeControl(false)
 					conn.Close()
 					go s.Restart()
 					return
 				}
-				s.controlChannel = conn
+				s.setControl(conn)
 				s.logger.Infof("%s control channel established successfully", s.config.Mode)
 
 				numCPU := runtime.NumCPU()
@@ -233,7 +235,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				for i := 0; i < numCPU; i++ {
 					go s.handleLoop()
 				}
-				s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+				s.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", s.config.Mode))
 			} else if strings.HasPrefix(r.URL.Path, "/tunnel") {
 				session, err := smux.Client(network.NewWSNetConn(conn), s.smuxConfig)
 				if err != nil {
@@ -274,9 +276,7 @@ func (s *WsMuxTransport) tunnelListener() {
 	}
 
 	<-s.ctx.Done()
-	if s.controlChannel != nil {
-		s.controlChannel.Close()
-	}
+	s.closeControl(false)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
@@ -466,3 +466,42 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 		}
 	}
 }
+
+
+func (s *WsMuxTransport) getControl() *websocket.Conn {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	return s.controlChannel
+}
+
+func (s *WsMuxTransport) setControl(conn *websocket.Conn) {
+	s.ctrlMu.Lock()
+	s.controlChannel = conn
+	s.ctrlMu.Unlock()
+}
+
+func (s *WsMuxTransport) writeControl(msgType int, data []byte) error {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	if s.controlChannel == nil {
+		return websocket.ErrCloseSent
+	}
+	_ = s.controlChannel.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return s.controlChannel.WriteMessage(msgType, data)
+}
+
+func (s *WsMuxTransport) closeControl(sendFarewell bool) {
+	s.ctrlMu.Lock()
+	cc := s.controlChannel
+	if cc != nil {
+		if sendFarewell {
+			_ = cc.SetWriteDeadline(time.Now().Add(400 * time.Millisecond))
+			_ = cc.WriteMessage(websocket.BinaryMessage, []byte{utils.SG_Closed})
+		}
+		_ = cc.Close()
+		s.controlChannel = nil
+	}
+	s.ctrlMu.Unlock()
+}
+
+func (s *WsMuxTransport) Status() string { return s.usageMonitor.GetStatus() }

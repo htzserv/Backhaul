@@ -75,7 +75,7 @@ func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 }
 
 func (s *TcpTransport) Start() {
-	s.config.TunnelStatus = "Disconnected (TCP)"
+	s.usageMonitor.SetStatus("Disconnected (TCP)")
 
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
@@ -86,7 +86,7 @@ func (s *TcpTransport) Start() {
 	s.channelHandshake()
 
 	if s.controlChannel != nil {
-		s.config.TunnelStatus = "Connected (TCP)"
+		s.usageMonitor.SetStatus("Connected (TCP)")
 
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
@@ -114,8 +114,6 @@ func (s *TcpTransport) Restart() {
 
 	// for removing timeout logs
 	level := s.logger.Level
-	s.logger.SetLevel(logrus.FatalLevel)
-
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -136,12 +134,10 @@ func (s *TcpTransport) Restart() {
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
+	s.usageMonitor.SetStatus("")
 	s.controlChannel = nil
 
 	// set the log level again
-	s.logger.SetLevel(level)
-
 	go s.Start()
 }
 
@@ -286,7 +282,8 @@ func (s *TcpTransport) tunnelListener() {
 		!s.config.Nodelay,
 	)
 	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		s.logger.Errorf("failed to start listener on %s: %v", s.config.BindAddr, err)
+		return
 		return
 	}
 
@@ -321,8 +318,8 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 			}
 
 			// Drop all suspicious packets from other address rather than server
-			if s.controlChannel != nil && s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
-				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
+			if s.controlChannel != nil && handlers.RemoteIPOf(s.controlChannel) != handlers.RemoteIPOf(tcpConn) {
+				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", handlers.RemoteIPOf(tcpConn), handlers.RemoteIPOf(s.controlChannel))
 				tcpConn.Close()
 				continue
 			}
@@ -371,18 +368,21 @@ func (s *TcpTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -396,7 +396,8 @@ func (s *TcpTransport) parsePortMappings() {
 				// Handle single port case
 				port, err := strconv.Atoi(localPortOrRange)
 				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port format: %s", localPortOrRange)
+				continue
 				}
 				localAddr = fmt.Sprintf(":%d", port)
 			}
@@ -409,18 +410,21 @@ func (s *TcpTransport) parsePortMappings() {
 			if strings.Contains(localPortOrRange, "-") {
 				rangeParts := strings.Split(localPortOrRange, "-")
 				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
+					s.logger.Errorf("invalid port range format: %s", localPortOrRange)
+				continue
 				}
 
 				// Parse and validate start and end ports
 				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
 				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
+					s.logger.Errorf("invalid start port in range: %s", rangeParts[0])
+				continue
 				}
 
 				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
 				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
+					s.logger.Errorf("invalid end port in range: %s", rangeParts[1])
+				continue
 				}
 
 				// Create listeners for all ports in the range
@@ -440,7 +444,8 @@ func (s *TcpTransport) parsePortMappings() {
 				}
 			}
 		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+			s.logger.Errorf("invalid port mapping format: %s", portMapping)
+				continue
 		}
 		// Start listeners for single port
 		go s.startListeners(localAddr, remoteAddr)
@@ -462,7 +467,8 @@ func (s *TcpTransport) startListeners(localAddr, remoteAddr string) {
 func (s *TcpTransport) localListener(localAddr string, remoteAddr string) {
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		s.logger.Fatalf("failed to listen on %s: %v", localAddr, err)
+		s.logger.Errorf("failed to listen on %s: %v", localAddr, err)
+		return
 		return
 	}
 
@@ -554,7 +560,7 @@ func (s *TcpTransport) handleLoop() {
 					}
 
 					// Handle data exchange between connections
-					go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, tunnelConn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+					go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, tunnelConn, s.logger, s.usageMonitor, handlers.LocalPortOf(localConn.conn), s.config.Sniffer)
 					break loop
 
 				}
@@ -562,3 +568,5 @@ func (s *TcpTransport) handleLoop() {
 		}
 	}
 }
+
+func (s *TcpTransport) Status() string { return s.usageMonitor.GetStatus() }

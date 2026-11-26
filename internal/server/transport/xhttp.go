@@ -45,6 +45,7 @@ type XhttpServerConfig struct {
 	ProxyProtocol    bool
 	FallbackAddr     string
 	XHTTPPath        string
+	XHTTPHost        string
 }
 
 type XhttpServerTransport struct {
@@ -114,7 +115,7 @@ func (s *XhttpServerTransport) Start() {
 	if s.config.WebPort > 0 {
 		go s.usageMonitor.Monitor()
 	}
-	s.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", s.config.Mode)
+	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.config.Mode))
 	go s.tunnelListener()
 }
 
@@ -151,7 +152,7 @@ func (s *XhttpServerTransport) Restart() {
 }
 
 func (s *XhttpServerTransport) tunnelListener() {
-	handler := network.NewXHTTPServerHandler(s.ctx, s.config.BindAddr, s.config.XHTTPPath, s.config.Token, s.config.FallbackAddr, func(purpose string, conn net.Conn) {
+	handler := network.NewXHTTPServerHandler(s.ctx, s.config.BindAddr, s.config.XHTTPPath, s.config.XHTTPHost, s.config.Token, s.config.FallbackAddr, func(purpose string, conn net.Conn) {
 		if purpose == "channel" {
 			if cc := s.getControl(); cc != nil {
 				s.logger.Warn("new xhttp control channel requested, triggering fast reconnect...")
@@ -161,7 +162,7 @@ func (s *XhttpServerTransport) tunnelListener() {
 				return
 			}
 			s.setControl(conn)
-			s.config.TunnelStatus = fmt.Sprintf("Connected (%s)", s.config.Mode)
+			s.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", s.config.Mode))
 			s.logger.Infof("%s control channel established successfully", s.config.Mode)
 
 			numCPU := runtime.NumCPU()
@@ -526,3 +527,5 @@ func (s *XhttpServerTransport) handleMuxSession(session *smux.Session) {
 		}
 	}
 }
+
+func (s *XhttpServerTransport) Status() string { return s.usageMonitor.GetStatus() }

@@ -11,7 +11,7 @@ import (
 func (c *Client) startFailover() {
 	remHost, portStr, err := net.SplitHostPort(c.config.RemoteAddr)
 	if err != nil {
-		c.logger.Fatalf("failover: invalid remote_addr %q: %v", c.config.RemoteAddr, err)
+		c.logger.Errorf("failover: invalid remote_addr %q: %v", c.config.RemoteAddr, err)
 		return
 	}
 	basePort := c.config.FailoverBasePort

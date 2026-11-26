@@ -125,7 +125,7 @@ func (c *XhttpClientTransport) Start() {
 	if err == nil {
 		c.sharedClients = sc
 	}
-	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.config.Mode)
+	c.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", c.config.Mode))
 	go c.channelDialer()
 }
 
@@ -200,7 +200,7 @@ func (c *XhttpClientTransport) channelDialer() {
 				continue
 			}
 			c.setControl(conn)
-			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
+			c.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", c.config.Mode))
 			c.logger.Infof("%s control channel established successfully", c.config.Mode)
 
 			go c.poolMaintainer()

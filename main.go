@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,12 +18,13 @@ import (
 var (
 	logger     = utils.NewLogger("info")
 	configPath *string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	runMu      sync.Mutex
+	runCtx     context.Context
+	runCancel  context.CancelFunc
 )
 
 // Define the version of the application
-const version = "v1.0.0"
+const version = "v1.1.0"
 
 func main() {
 	configPath = flag.String("c", "", "path to the configuration file (TOML format)")
@@ -30,39 +32,51 @@ func main() {
 
 	flag.Parse()
 
-	// If the version flag is provided, print the version and exit
 	if *showVersion {
 		fmt.Println(version)
 		os.Exit(0)
 	}
 
-	// Check if the configPath is provided
 	if *configPath == "" {
 		logger.Fatalf("Usage: %s -c /path/to/config.toml", flag.CommandLine.Name())
 	}
 
-	// Create a context for graceful shutdown handling
-	ctx, cancel = context.WithCancel(context.Background())
+	if err := cmd.ValidateConfig(*configPath); err != nil {
+		logger.Fatalf("invalid configuration: %v", err)
+	}
 
-	// Set up signal handling for graceful shutdown
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	runMu.Lock()
+	runCtx, runCancel = context.WithCancel(appCtx)
+	curCtx := runCtx
+	runMu.Unlock()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	go cmd.Run(*configPath, ctx)
-	go hotReload()
+	go cmd.Run(*configPath, curCtx)
+	go hotReload(appCtx)
 
 	<-sigChan
+	logger.Info("received shutdown signal, stopping...")
 
-	cancel()
+	runMu.Lock()
+	if runCancel != nil {
+		runCancel()
+	}
+	runMu.Unlock()
+	appCancel()
 
 	time.Sleep(1 * time.Second)
 }
 
-func hotReload() {
-	// Get initial modification time of the config file
+func hotReload(appCtx context.Context) {
 	lastModTime, err := getLastModTime(*configPath)
 	if err != nil {
-		logger.Fatalf("Error getting modification time: %v", err)
+		logger.Errorf("hot-reload disabled (stat failed): %v", err)
+		return
 	}
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -70,7 +84,7 @@ func hotReload() {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-appCtx.Done():
 			return
 		case <-ticker.C:
 			modTime, err := getLastModTime(*configPath)
@@ -79,23 +93,33 @@ func hotReload() {
 				continue
 			}
 
-			// If the modification time has changed, reload the app
 			if modTime.After(lastModTime) {
-				logger.Info("Config file changed, reloading application")
-
-				// Cancel the previous context to stop the old running instance
-				cancel()
-
-				time.Sleep(2 * time.Second)
-
-				// Create a new context for the new instance
-				newCtx, newCancel := context.WithCancel(context.Background())
-				go cmd.Run(*configPath, newCtx)
-
-				// Update the last modification time and the context
 				lastModTime = modTime
-				ctx = newCtx
-				cancel = newCancel
+				// Validate new config BEFORE shutting down the running instance!
+				if err := cmd.ValidateConfig(*configPath); err != nil {
+					logger.Errorf("Config file changed but is invalid — keeping active tunnel running: %v", err)
+					continue
+				}
+
+				logger.Info("Config file changed and validated, reloading application...")
+				runMu.Lock()
+				if runCancel != nil {
+					runCancel()
+				}
+				runMu.Unlock()
+
+				select {
+				case <-appCtx.Done():
+					return
+				case <-time.After(1500 * time.Millisecond):
+				}
+
+				runMu.Lock()
+				runCtx, runCancel = context.WithCancel(appCtx)
+				newCtx := runCtx
+				runMu.Unlock()
+
+				go cmd.Run(*configPath, newCtx)
 			}
 		}
 	}

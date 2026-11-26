@@ -74,7 +74,7 @@ func (c *TcpTransport) Start() {
 		go c.usageMonitor.Monitor()
 	}
 
-	c.config.TunnelStatus = "Disconnected (TCP)"
+	c.usageMonitor.SetStatus("Disconnected (TCP)")
 
 	go c.channelDialer()
 }
@@ -89,8 +89,6 @@ func (c *TcpTransport) Restart() {
 
 	// for removing timeout logs
 	level := c.logger.Level
-	c.logger.SetLevel(logrus.FatalLevel)
-
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -109,14 +107,12 @@ func (c *TcpTransport) Restart() {
 	// Re-initialize variables
 	c.controlChannel = nil
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
-	c.config.TunnelStatus = ""
+	c.usageMonitor.SetStatus("")
 	c.poolConnections = 0
 	c.loadConnections = 0
 	c.controlFlow = make(chan struct{}, 100)
 
 	// set the log level again
-	c.logger.SetLevel(level)
-
 	go c.Start()
 }
 
@@ -170,7 +166,7 @@ func (c *TcpTransport) channelDialer() {
 				c.controlChannel = tunnelTCPConn
 				c.logger.Info("control channel established successfully")
 
-				c.config.TunnelStatus = "Connected (TCP)"
+				c.usageMonitor.SetStatus("Connected (TCP)")
 				go c.poolMaintainer()
 				go c.channelHandler()
 

@@ -22,6 +22,7 @@ const (
 	gamePktBeacon = 0x01
 	gamePktUp     = 0x02
 	gamePktDown   = 0x03
+	gameHdrLen    = 1 + 4 + 8 + 4 + 2 // pktType(1) + epoch(4) + seq(8) + flowID(4) + targetPort(2) = 19 bytes
 )
 
 type GameModeConfig struct {
@@ -33,25 +34,39 @@ type GameModeConfig struct {
 	Ports      []string
 }
 
+type gamePortRule struct {
+	localPort  int
+	targetPort int
+	targetHost string
+}
+
 type gameDedup struct {
 	mu     sync.Mutex
+	epoch  uint32
 	maxSeq uint64
 	bits   [8]uint64 // 512-packet sliding deduplication window
 }
 
-func (d *gameDedup) accept(seq uint64) bool {
-	if seq == 0 {
+// accept returns true only for the first arrival of (epoch, seq).
+// When a peer restarts with a new random epoch, the window resets automatically.
+func (d *gameDedup) accept(epoch uint32, seq uint64) bool {
+	if seq == 0 || epoch == 0 {
 		return false
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.epoch != epoch {
+		d.epoch = epoch
+		d.maxSeq = seq
+		d.bits = [8]uint64{1}
+		return true
+	}
 	if seq > d.maxSeq {
 		shift := seq - d.maxSeq
 		if shift >= 512 {
 			d.bits = [8]uint64{}
 		} else {
 			for i := uint64(0); i < shift; i++ {
-				// shift bitmap by 1 bit
 				var carry uint64
 				for w := 0; w < 8; w++ {
 					nextCarry := d.bits[w] >> 63
@@ -77,8 +92,18 @@ func (d *gameDedup) accept(seq uint64) bool {
 	return true
 }
 
+func randomEpoch() uint32 {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	v := binary.BigEndian.Uint32(b[:])
+	if v == 0 {
+		v = 1
+	}
+	return v
+}
+
 func newGameAEAD(token string) (cipher.AEAD, error) {
-	key := sha256.Sum256([]byte("bh-game-mode-v1:" + token))
+	key := sha256.Sum256([]byte("bh-game-mode-v2:" + token))
 	blk, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, err
@@ -86,55 +111,89 @@ func newGameAEAD(token string) (cipher.AEAD, error) {
 	return cipher.NewGCM(blk)
 }
 
-func sealGameDatagram(aead cipher.AEAD, pktType byte, seq uint64, flowID uint32, targetPort uint16, payload []byte) []byte {
-	plain := make([]byte, 1+8+4+2+len(payload))
+func sealGameDatagram(aead cipher.AEAD, pktType byte, epoch uint32, seq uint64, flowID uint32, targetPort uint16, payload []byte) []byte {
+	plain := make([]byte, gameHdrLen+len(payload))
 	plain[0] = pktType
-	binary.BigEndian.PutUint64(plain[1:9], seq)
-	binary.BigEndian.PutUint32(plain[9:13], flowID)
-	binary.BigEndian.PutUint16(plain[13:15], targetPort)
-	copy(plain[15:], payload)
+	binary.BigEndian.PutUint32(plain[1:5], epoch)
+	binary.BigEndian.PutUint64(plain[5:13], seq)
+	binary.BigEndian.PutUint32(plain[13:17], flowID)
+	binary.BigEndian.PutUint16(plain[17:19], targetPort)
+	copy(plain[gameHdrLen:], payload)
 
 	nonce := make([]byte, aead.NonceSize())
 	_, _ = rand.Read(nonce)
 	return aead.Seal(nonce, nonce, plain, nil)
 }
 
-func openGameDatagram(aead cipher.AEAD, raw []byte) (pktType byte, seq uint64, flowID uint32, targetPort uint16, payload []byte, ok bool) {
+func openGameDatagram(aead cipher.AEAD, raw []byte) (pktType byte, epoch uint32, seq uint64, flowID uint32, targetPort uint16, payload []byte, ok bool) {
 	ns := aead.NonceSize()
-	if len(raw) <= ns+aead.Overhead()+15 {
-		return 0, 0, 0, 0, nil, false
+	if len(raw) < ns+aead.Overhead()+gameHdrLen {
+		return 0, 0, 0, 0, 0, nil, false
 	}
 	plain, err := aead.Open(nil, raw[:ns], raw[ns:], nil)
-	if err != nil || len(plain) < 15 {
-		return 0, 0, 0, 0, nil, false
+	if err != nil || len(plain) < gameHdrLen {
+		return 0, 0, 0, 0, 0, nil, false
 	}
-	return plain[0], binary.BigEndian.Uint64(plain[1:9]), binary.BigEndian.Uint32(plain[9:13]), binary.BigEndian.Uint16(plain[13:15]), plain[15:], true
+	return plain[0],
+		binary.BigEndian.Uint32(plain[1:5]),
+		binary.BigEndian.Uint64(plain[5:13]),
+		binary.BigEndian.Uint32(plain[13:17]),
+		binary.BigEndian.Uint16(plain[17:19]),
+		plain[gameHdrLen:],
+		true
 }
 
-func parseGamePortMap(entries []string) [][2]int {
-	var out [][2]int
+func parseGamePortMap(entries []string) []gamePortRule {
+	var out []gamePortRule
 	for _, raw := range entries {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
 		parts := strings.SplitN(raw, "=", 2)
-		lp, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		lhs := strings.TrimSpace(parts[0])
+
+		targetHost := "127.0.0.1"
+		targetFixedPort := 0
+		if len(parts) == 2 {
+			rhs := strings.TrimSpace(parts[1])
+			if h, pStr, err := net.SplitHostPort(rhs); err == nil {
+				if h != "" {
+					targetHost = h
+				}
+				if v, e := strconv.Atoi(pStr); e == nil && v >= 1 && v <= 65535 {
+					targetFixedPort = v
+				}
+			} else if v, e := strconv.Atoi(rhs); e == nil && v >= 1 && v <= 65535 {
+				targetFixedPort = v
+			}
+		}
+
+		if strings.Contains(lhs, "-") {
+			rp := strings.SplitN(lhs, "-", 2)
+			lo, e1 := strconv.Atoi(strings.TrimSpace(rp[0]))
+			hi, e2 := strconv.Atoi(strings.TrimSpace(rp[1]))
+			if e1 == nil && e2 == nil && lo >= 1 && hi <= 65535 && hi >= lo && hi-lo <= 512 {
+				for p := lo; p <= hi; p++ {
+					tp := p
+					if targetFixedPort > 0 {
+						tp = targetFixedPort
+					}
+					out = append(out, gamePortRule{localPort: p, targetPort: tp, targetHost: targetHost})
+				}
+			}
+			continue
+		}
+
+		lp, err := strconv.Atoi(lhs)
 		if err != nil || lp < 1 || lp > 65535 {
 			continue
 		}
-		rp := lp
-		if len(parts) == 2 {
-			_, pStr, err := net.SplitHostPort(strings.TrimSpace(parts[1]))
-			if err == nil {
-				if v, e := strconv.Atoi(pStr); e == nil && v >= 1 && v <= 65535 {
-					rp = v
-				}
-			} else if v, e := strconv.Atoi(strings.TrimSpace(parts[1])); e == nil && v >= 1 && v <= 65535 {
-				rp = v
-			}
+		tp := lp
+		if targetFixedPort > 0 {
+			tp = targetFixedPort
 		}
-		out = append(out, [2]int{lp, rp})
+		out = append(out, gamePortRule{localPort: lp, targetPort: tp, targetHost: targetHost})
 	}
 	return out
 }
@@ -148,8 +207,8 @@ func StartGameModeServer(ctx context.Context, cfg GameModeConfig, logger *logrus
 	if cfg.Copies > 4 {
 		cfg.Copies = 4
 	}
-	portMap := parseGamePortMap(cfg.Ports)
-	if len(portMap) == 0 || cfg.BasePort <= 0 {
+	portRules := parseGamePortMap(cfg.Ports)
+	if len(portRules) == 0 || cfg.BasePort <= 0 {
 		return
 	}
 	aead, err := newGameAEAD(cfg.Token)
@@ -177,20 +236,45 @@ func StartGameModeServer(ctx context.Context, cfg GameModeConfig, logger *logrus
 		return
 	}
 	logger.Infof("Game Mode UDP accelerator active on %d carrier ports (%d..%d) for %d game ports",
-		len(carrierConns), cfg.BasePort, cfg.BasePort+len(carrierConns)-1, len(portMap))
+		len(carrierConns), cfg.BasePort, cfg.BasePort+len(carrierConns)-1, len(portRules))
 
 	type userFlow struct {
 		id       uint32
+		key      string
 		listener *net.UDPConn
 		addr     *net.UDPAddr
-		lastSeen int64
+		lastSeen atomic.Int64
 	}
 	var flowMu sync.RWMutex
 	flowsByKey := map[string]*userFlow{}
 	flowsByID := map[uint32]*userFlow{}
 	var nextFlowID uint32
+	srvEpoch := randomEpoch()
 	var seqCounter atomic.Uint64
 	var downDedup gameDedup
+	var beaconDedup gameDedup
+
+	// Background flow reaper prevents memory leaks on long-running game servers
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cutoff := time.Now().Add(-90 * time.Second).Unix()
+				flowMu.Lock()
+				for id, uf := range flowsByID {
+					if uf.lastSeen.Load() < cutoff {
+						delete(flowsByID, id)
+						delete(flowsByKey, uf.key)
+					}
+				}
+				flowMu.Unlock()
+			}
+		}
+	}()
 
 	// Listen for carrier packets (beacons + downlink game datagrams)
 	for i, cc := range carrierConns {
@@ -210,20 +294,30 @@ func StartGameModeServer(ctx context.Context, cfg GameModeConfig, logger *logrus
 				if err != nil {
 					continue
 				}
-				pktType, seq, flowID, _, payload, ok := openGameDatagram(aead, buf[:n])
+				pktType, ep, seq, flowID, _, payload, ok := openGameDatagram(aead, buf[:n])
 				if !ok {
 					continue
 				}
-				peerMu.Lock()
-				peerAddrs[idx] = raddr
-				peerMu.Unlock()
-
-				if pktType == gamePktDown && downDedup.accept(seq) {
-					flowMu.RLock()
-					uf := flowsByID[flowID]
-					flowMu.RUnlock()
-					if uf != nil {
-						_, _ = uf.listener.WriteToUDP(payload, uf.addr)
+				if pktType == gamePktBeacon {
+					if beaconDedup.accept(ep, seq) {
+						peerMu.Lock()
+						peerAddrs[idx] = raddr
+						peerMu.Unlock()
+					}
+					continue
+				}
+				if pktType == gamePktDown {
+					peerMu.Lock()
+					peerAddrs[idx] = raddr
+					peerMu.Unlock()
+					if downDedup.accept(ep, seq) {
+						flowMu.RLock()
+						uf := flowsByID[flowID]
+						flowMu.RUnlock()
+						if uf != nil {
+							uf.lastSeen.Store(time.Now().Unix())
+							_, _ = uf.listener.WriteToUDP(payload, uf.addr)
+						}
 					}
 				}
 			}
@@ -231,8 +325,8 @@ func StartGameModeServer(ctx context.Context, cfg GameModeConfig, logger *logrus
 	}
 
 	// Listen on each public UDP game port
-	for _, pair := range portMap {
-		localPort, targetPort := pair[0], uint16(pair[1])
+	for _, rule := range portRules {
+		localPort, targetPort := rule.localPort, uint16(rule.targetPort)
 		go func() {
 			uaddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", localPort))
 			if err != nil {
@@ -261,15 +355,15 @@ func StartGameModeServer(ctx context.Context, cfg GameModeConfig, logger *logrus
 				uf, exists := flowsByKey[key]
 				if !exists {
 					nextFlowID++
-					uf = &userFlow{id: nextFlowID, listener: uln, addr: cliAddr}
+					uf = &userFlow{id: nextFlowID, key: key, listener: uln, addr: cliAddr}
 					flowsByKey[key] = uf
 					flowsByID[uf.id] = uf
 				}
-				uf.lastSeen = time.Now().Unix()
+				uf.lastSeen.Store(time.Now().Unix())
 				flowMu.Unlock()
 
 				seq := seqCounter.Add(1)
-				pkt := sealGameDatagram(aead, gamePktUp, seq, uf.id, targetPort, buf[:n])
+				pkt := sealGameDatagram(aead, gamePktUp, srvEpoch, seq, uf.id, targetPort, buf[:n])
 				peerMu.RLock()
 				for i, c := range carrierConns {
 					if i < len(peerAddrs) && peerAddrs[i] != nil {
@@ -300,6 +394,14 @@ func StartGameModeClient(ctx context.Context, cfg GameModeConfig, logger *logrus
 		return
 	}
 
+	// Optional per-port custom target host map if game_ports is also specified on client
+	targetHostByPort := map[uint16]string{}
+	for _, r := range parseGamePortMap(cfg.Ports) {
+		if r.targetHost != "" && r.targetHost != "127.0.0.1" {
+			targetHostByPort[uint16(r.targetPort)] = r.targetHost
+		}
+	}
+
 	carrierConns := make([]*net.UDPConn, 0, cfg.Copies)
 	for i := 0; i < cfg.Copies; i++ {
 		raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.RemoteHost, strconv.Itoa(cfg.BasePort+i)))
@@ -318,7 +420,9 @@ func StartGameModeClient(ctx context.Context, cfg GameModeConfig, logger *logrus
 	logger.Infof("Game Mode UDP client connected on %d parallel carrier ports (%s:%d..%d)",
 		len(carrierConns), cfg.RemoteHost, cfg.BasePort, cfg.BasePort+len(carrierConns)-1)
 
+	cliEpoch := randomEpoch()
 	var seqCounter atomic.Uint64
+	var beaconSeq atomic.Uint64
 	var upDedup gameDedup
 	var flowMu sync.Mutex
 	flowConns := map[uint32]*net.UDPConn{}
@@ -329,13 +433,15 @@ func StartGameModeClient(ctx context.Context, cfg GameModeConfig, logger *logrus
 		}
 	}
 
-	// Periodic beacons so Iran server always knows all carrier return addresses
+	// Send independent beacon seq per carrier so Iran server records all carrier addresses
 	go func() {
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
 		for {
-			pkt := sealGameDatagram(aead, gamePktBeacon, seqCounter.Add(1), 0, 0, []byte("hb"))
-			sendToAllCarriers(pkt)
+			for _, c := range carrierConns {
+				pkt := sealGameDatagram(aead, gamePktBeacon, cliEpoch, beaconSeq.Add(1), 0, 0, []byte("hb"))
+				_, _ = c.Write(pkt)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -360,14 +466,18 @@ func StartGameModeClient(ctx context.Context, cfg GameModeConfig, logger *logrus
 				if err != nil {
 					continue
 				}
-				pktType, seq, flowID, targetPort, payload, ok := openGameDatagram(aead, buf[:n])
-				if !ok || pktType != gamePktUp || !upDedup.accept(seq) {
+				pktType, ep, seq, flowID, targetPort, payload, ok := openGameDatagram(aead, buf[:n])
+				if !ok || pktType != gamePktUp || !upDedup.accept(ep, seq) {
 					continue
 				}
 				flowMu.Lock()
 				lc, exists := flowConns[flowID]
 				if !exists {
-					dst, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", targetPort))
+					dstHost := targetHostByPort[targetPort]
+					if dstHost == "" {
+						dstHost = "127.0.0.1"
+					}
+					dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(dstHost, strconv.Itoa(int(targetPort))))
 					if err == nil {
 						if dconn, derr := net.DialUDP("udp", nil, dst); derr == nil {
 							lc = dconn
@@ -386,7 +496,7 @@ func StartGameModeClient(ctx context.Context, cfg GameModeConfig, logger *logrus
 									if rerr != nil {
 										return
 									}
-									respPkt := sealGameDatagram(aead, gamePktDown, seqCounter.Add(1), fid, 0, rb[:rn])
+									respPkt := sealGameDatagram(aead, gamePktDown, cliEpoch, seqCounter.Add(1), fid, 0, rb[:rn])
 									sendToAllCarriers(respPkt)
 								}
 							}(flowID, lc)

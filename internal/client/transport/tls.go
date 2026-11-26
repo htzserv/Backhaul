@@ -104,7 +104,7 @@ func (c *TlsClientTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
-	c.config.TunnelStatus = fmt.Sprintf("Disconnected (%s)", c.modeLabel())
+	c.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", c.modeLabel()))
 	go c.channelDialer()
 }
 
@@ -144,7 +144,7 @@ func (c *TlsClientTransport) dialTLS(nodelay bool, rcvBuf, sndBuf, mss int, retr
 		if err != nil {
 			return nil, fmt.Errorf("invalid remote_addr: %w", err)
 		}
-		dialAddr = net.JoinHostPort(c.config.EdgeIP, port)
+		dialAddr = net.JoinHostPort(network.PickEdgeIP(c.config.EdgeIP), port)
 	}
 
 	rawConn, err := network.TcpDialer(c.ctx, dialAddr, "", c.config.DialTimeOut, c.config.KeepAlive, nodelay, retry, rcvBuf, sndBuf, mss)
@@ -192,7 +192,7 @@ func (c *TlsClientTransport) channelDialer() {
 
 			c.setControl(conn)
 			c.logger.Infof("%s control channel established successfully", c.modeLabel())
-			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.modeLabel())
+			c.usageMonitor.SetStatus(fmt.Sprintf("Connected (%s)", c.modeLabel()))
 
 			go c.poolMaintainer()
 			go c.channelHandler()
